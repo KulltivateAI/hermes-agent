@@ -4532,3 +4532,444 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+# ---------------------------------------------------------------------------
+# Phantom Push Gate Tests (RED - should fail until backend implementation)
+# ---------------------------------------------------------------------------
+
+def test_phantom_push_error_class_structure(kanban_home):
+    """PhantomPushError class mirrors HallucinatedCardsError structure."""
+    # This test will fail until PhantomPushError is implemented in kanban_db.py
+    import hermes_cli.kanban_db as kb
+    
+    # Test the class exists and has the expected interface
+    assert hasattr(kb, 'PhantomPushError'), "PhantomPushError class should exist"
+    
+    # Test class can be instantiated with phantom list and completing task id
+    phantom_refs = ["feature/phantom-branch", "commit/deadbeef"]
+    task_id = "t_test123"
+    
+    try:
+        error = kb.PhantomPushError(phantom_refs, task_id)
+        assert error.phantom == phantom_refs
+        assert error.completing_task_id == task_id
+        assert "phantom" in str(error).lower()
+    except TypeError:
+        # Class doesn't exist yet or has wrong signature
+        assert False, "PhantomPushError should have (phantom, completing_task_id) signature"
+
+
+def test_complete_with_verified_push_succeeds(kanban_home, monkeypatch):
+    """Completion claiming a verified branch/SHA (ls-remote confirms present) succeeds."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    
+    # Mock git ls-remote to return the claimed SHA (simulating verified push)
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(
+                args[0], 0, stdout="abc123def456\trefs/heads/feature/test-branch\n"
+            )
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # This should succeed since ls-remote confirms the branch exists
+        ok = kb.complete_task(
+            conn, task,
+            summary="pushed feature/test-branch successfully",
+            metadata={"branch": "feature/test-branch", "sha": "abc123def456"},
+        )
+        assert ok is True
+        assert kb.get_task(conn, task).status == "done"
+        
+        # No completion_blocked_phantom_push event should be emitted
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert "completion_blocked_phantom_push" not in kinds
+        assert "completed" in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_with_phantom_branch_blocks(kanban_home, monkeypatch):
+    """Completion claiming a phantom branch (ls-remote shows absent) blocks task."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    import pytest
+    
+    # Mock git ls-remote to return empty (simulating phantom branch)
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(args[0], 0, stdout="")
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # This should fail with PhantomPushError
+        with pytest.raises(kb.PhantomPushError) as excinfo:
+            kb.complete_task(
+                conn, task,
+                summary="pushed phantom branch",
+                metadata={"branch": "feature/phantom-branch", "sha": "deadbeef"},
+            )
+        
+        # Check error structure
+        assert "feature/phantom-branch" in excinfo.value.phantom or "deadbeef" in excinfo.value.phantom
+        
+        # Task should stay in prior state (not move to done)
+        assert kb.get_task(conn, task).status == "ready"
+        
+        # completion_blocked_phantom_push event should be emitted
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert "completion_blocked_phantom_push" in kinds
+        assert "completed" not in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_with_no_git_remote_skips_check(kanban_home, monkeypatch):
+    """Completion in workspace with no git remote skips phantom check."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    
+    # Mock git ls-remote to fail (simulating no remote)
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            raise subprocess.CalledProcessError(128, args[0], stderr="No such remote")
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # Should succeed despite git failure (check is skipped)
+        ok = kb.complete_task(
+            conn, task,
+            summary="work in scratch workspace",
+            metadata={"branch": "feature/local-only"},
+        )
+        assert ok is True
+        assert kb.get_task(conn, task).status == "done"
+        
+        # No phantom push events
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert "completion_blocked_phantom_push" not in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_with_network_failure_allows_completion(kanban_home, monkeypatch):
+    """ls-remote network failure (transient) does NOT block completion."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    
+    # Mock git ls-remote to timeout/fail
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            raise subprocess.TimeoutExpired(args[0], 30)
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # Should succeed despite network failure (transient failures allowed)
+        ok = kb.complete_task(
+            conn, task,
+            summary="network issues, but work is done",
+            metadata={"branch": "feature/pushed-but-network-down"},
+        )
+        assert ok is True
+        assert kb.get_task(conn, task).status == "done"
+        
+        # Should emit an advisory event but still complete
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        # May emit an advisory warning, but NOT completion_blocked_phantom_push
+        assert "completion_blocked_phantom_push" not in kinds
+        assert "completed" in kinds
+    finally:
+        conn.close()
+
+
+def test_block_task_with_phantom_push_also_gated(kanban_home, monkeypatch):
+    """kanban_block claiming phantom refs gets same gate treatment."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    import pytest
+    
+    # Mock git ls-remote to return empty
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(args[0], 0, stdout="")
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        kb.claim_task(conn, task)  # Move to running first
+        
+        # This should fail with PhantomPushError (if block_task carries metadata)
+        with pytest.raises(kb.PhantomPushError):
+            kb.block_task(
+                conn, task,
+                reason="review-required: phantom push",
+                metadata={"diff_path": "/path/to/phantom", "pr_url": "phantom-pr"},
+            )
+        
+        # Task should stay in prior state
+        assert kb.get_task(conn, task).status == "running"
+        
+        # completion_blocked_phantom_push event emitted
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert "completion_blocked_phantom_push" in kinds
+        assert "blocked" not in kinds
+    finally:
+        conn.close()
+
+
+def test_complete_prose_only_phantom_is_advisory(kanban_home, monkeypatch):
+    """Summary mentioning phantom commits without metadata is advisory only."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    
+    # Mock git ls-remote doesn't matter - no metadata means no hard gate
+    def mock_run(*args, **kwargs):
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # Should succeed - prose mentions are advisory only
+        ok = kb.complete_task(
+            conn, task,
+            summary="pushed commit abc1234 and fixed the bug",
+            # No metadata - this is key
+        )
+        assert ok is True
+        assert kb.get_task(conn, task).status == "done"
+        
+        # May emit suspected_phantom_push advisory event, but NOT blocking
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert "completion_blocked_phantom_push" not in kinds
+        assert "completed" in kinds
+        # Optional: assert "suspected_phantom_push" in kinds
+    finally:
+        conn.close()
+
+
+def test_record_phantom_push_block_helper(kanban_home):
+    """DB helper function records phantom push block event correctly."""
+    import hermes_cli.kanban_db as kb
+    import json
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # Test the helper function (exact name TBD - may need coordination with backend)
+        phantom_refs = ["feature/phantom", "deadbeef123"]
+        summary_preview = "attempted to push phantom refs"
+        
+        # This should work and emit the event
+        kb.record_phantom_push_block(conn, task, phantom_refs, summary_preview)
+        
+        # Check event was recorded
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id=? AND kind='completion_blocked_phantom_push' "
+            "ORDER BY id DESC LIMIT 1",
+            (task,),
+        ).fetchone()
+        
+        assert row is not None, "completion_blocked_phantom_push event should be recorded"
+        payload = json.loads(row["payload"])
+        assert payload["phantom_refs"] == phantom_refs
+        assert payload["summary_preview"] == summary_preview
+        
+        # Task state should remain unchanged by the helper
+        assert kb.get_task(conn, task).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_phantom_push_can_retry_after_rejection(kanban_home, monkeypatch):
+    """Worker can retry completion after phantom push rejection."""
+    import hermes_cli.kanban_db as kb
+    import subprocess
+    import pytest
+    
+    # First call: phantom (empty ls-remote)
+    # Second call: verified (ls-remote returns refs)
+    call_count = 0
+    def mock_run(*args, **kwargs):
+        nonlocal call_count
+        if args[0][:2] == ["git", "ls-remote"]:
+            call_count += 1
+            if call_count == 1:
+                # First call: phantom
+                return subprocess.CompletedProcess(args[0], 0, stdout="")
+            else:
+                # Second call: verified
+                return subprocess.CompletedProcess(
+                    args[0], 0, stdout="abc123\trefs/heads/feature/real-branch\n"
+                )
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    conn = kb.connect()
+    try:
+        task = kb.create_task(conn, title="test-task", assignee="alice")
+        
+        # First attempt: phantom push rejected
+        with pytest.raises(kb.PhantomPushError):
+            kb.complete_task(
+                conn, task,
+                summary="phantom attempt",
+                metadata={"branch": "feature/phantom"},
+            )
+        assert kb.get_task(conn, task).status == "ready"
+        
+        # Retry with verified ref - should succeed
+        ok = kb.complete_task(
+            conn, task,
+            summary="retry with real push",
+            metadata={"branch": "feature/real-branch", "sha": "abc123"},
+        )
+        assert ok is True
+        assert kb.get_task(conn, task).status == "done"
+        
+        # Both events should be present
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (task,),
+            )
+        ]
+        assert kinds.count("completion_blocked_phantom_push") == 1
+        assert kinds.count("completed") == 1
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool layer tests (testing kanban_tools.py integration)
+# ---------------------------------------------------------------------------
+
+def test_kanban_complete_tool_phantom_push_returns_error(kanban_home, monkeypatch):
+    """kanban_complete tool returns retry-friendly tool_error on phantom push."""
+    import subprocess
+    from tools.kanban_tools import _handle_complete
+    
+    # Mock git ls-remote to simulate phantom
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(args[0], 0, stdout="")
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    # Mock HERMES_KANBAN_WORKSPACE and other env vars
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/fake-workspace")
+    
+    # Create a test task
+    import hermes_cli.kanban_db as kb
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="tool-test", assignee="alice")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        
+        # Tool call should return tool_error (not raise exception)
+        result = _handle_complete({
+            "summary": "tool phantom push attempt",
+            "metadata": {"branch": "feature/phantom", "sha": "deadbeef"},
+        })
+        
+        # Should be a tool_error response, not success
+        assert "tool_error" in result or "error" in result
+        
+        # Task should still be in original state
+        assert kb.get_task(conn, task).status == "ready"
+
+
+def test_kanban_complete_tool_verified_push_succeeds(kanban_home, monkeypatch):
+    """kanban_complete tool returns success on verified push."""
+    import subprocess
+    from tools.kanban_tools import _handle_complete
+    
+    # Mock git ls-remote to simulate verified push
+    def mock_run(*args, **kwargs):
+        if args[0][:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(
+                args[0], 0, stdout="abc123\trefs/heads/feature/verified\n"
+            )
+        return subprocess.run(*args, **kwargs)
+    
+    monkeypatch.setattr("subprocess.run", mock_run)
+    
+    # Mock environment
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/fake-workspace")
+    
+    # Create test task
+    import hermes_cli.kanban_db as kb
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="tool-test", assignee="alice")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task)
+        
+        # Tool call should succeed
+        result = _handle_complete({
+            "summary": "tool verified push",
+            "metadata": {"branch": "feature/verified", "sha": "abc123"},
+        })
+        
+        # Should be successful response (not tool_error)
+        assert "tool_error" not in result and "error" not in result
+        
+        # Task should be completed
+        assert kb.get_task(conn, task).status == "done"
