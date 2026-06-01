@@ -3073,6 +3073,160 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class PhantomPushError(ValueError):
+    """Raised by ``complete_task`` and ``block_task`` when metadata claims
+    pushed refs (branch/SHA/PR) that are not verified by ``git ls-remote``.
+    
+    The phantom list is attached as ``.phantom`` for callers that want
+    structured access. Kept as ``ValueError`` subclass so existing
+    tool-error handlers treat it as a recoverable user error.
+    """
+    
+    def __init__(self, phantom: list[str], completing_task_id: str):
+        self.phantom = list(phantom)
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            f"completion blocked: claimed push refs that are not present on origin: "
+            f"{', '.join(phantom)}. Check that you actually pushed these refs, then retry."
+        )
+
+
+def record_phantom_push_block(
+    conn: sqlite3.Connection, 
+    task_id: str, 
+    phantom_refs: list[str], 
+    summary_preview: Optional[str]
+) -> None:
+    """Record a phantom push block event in a small write transaction.
+    
+    This emits a ``completion_blocked_phantom_push`` audit event before
+    any state mutation, allowing the rejection to be tracked even when
+    the completion/block is aborted.
+    """
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_phantom_push",
+            {
+                "phantom_refs": phantom_refs,
+                "summary_preview": summary_preview,
+            },
+        )
+
+
+def _verify_push_refs(
+    task_id: str,
+    metadata: Optional[dict], 
+    summary: Optional[str] = None
+) -> tuple[list[str], list[str]]:
+    """Verify claimed push refs against git ls-remote origin.
+    
+    Returns (verified_refs, phantom_refs). On network/git failure,
+    logs a warning but treats all refs as verified to avoid blocking
+    completions during transient issues.
+    
+    Edge cases handled:
+    1. No git remote / detached / scratch with no repo → SKIP the check entirely, never block.
+    2. ls-remote NETWORK/transient failure → do NOT hard-block. Advisory-warn + ALLOW completion.
+    3. Prose-only claims are advisory, not blocking.
+    """
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    if not metadata:
+        return [], []
+    
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not workspace or not os.path.isdir(workspace):
+        # Edge case 1: No git remote / detached / scratch with no repo 
+        # → SKIP the check entirely, never block.
+        logger.debug(f"No workspace or not a directory: {workspace}, skipping phantom push check")
+        return [], []
+    
+    # Extract explicit metadata claims (BLOCKING tier)
+    claimed_refs = []
+    if metadata.get("branch"):
+        claimed_refs.append(metadata["branch"])
+    if metadata.get("pushed_sha") or metadata.get("sha") or metadata.get("commit"):
+        sha = metadata.get("pushed_sha") or metadata.get("sha") or metadata.get("commit")
+        claimed_refs.append(sha)
+    if metadata.get("pr_url"):
+        claimed_refs.append(metadata["pr_url"])
+    if metadata.get("diff_path"):
+        claimed_refs.append(metadata["diff_path"])
+    # PR URL ref resolution would go here if needed
+    
+    if not claimed_refs:
+        # Prose scan for advisory warnings (not blocking)
+        if summary:
+            # Look for "pushed", "git push", 7-40 hex SHAs, PR urls in prose
+            prose_patterns = [
+                r'\bpushed\b',
+                r'\bgit push\b',
+                r'\b[0-9a-f]{7,40}\b',  # hex SHAs
+                r'github\.com/[^/]+/[^/]+/pull/\d+',  # PR URLs
+            ]
+            for pattern in prose_patterns:
+                if re.search(pattern, summary, re.IGNORECASE):
+                    # Could emit suspected_phantom_push advisory event here
+                    # but tests specify this as advisory-only (no blocking)
+                    logger.info(f"Detected potential push references in prose but not blocking: {task_id}")
+                    break
+        return [], []
+    
+    # Run git ls-remote to verify explicit claims
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "origin"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode != 0:
+            # Edge case 2: ls-remote NETWORK/transient failure 
+            # → do NOT hard-block. Advisory-warn + ALLOW completion
+            logger.warning(
+                f"git ls-remote failed (exit {result.returncode}), "
+                f"allowing completion anyway: {result.stderr.strip()}"
+            )
+            return claimed_refs, []  # treat all as verified
+            
+        # Parse ls-remote output: "SHA\trefs/heads/branch" or "SHA\tHEAD"
+        remote_refs = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if '\t' in line:
+                sha, ref = line.split('\t', 1)
+                remote_refs.add(sha.strip())  # Add SHA
+                # Add branch name if it's a heads ref
+                if ref.startswith('refs/heads/'):
+                    branch_name = ref[len('refs/heads/'):]
+                    remote_refs.add(branch_name)
+                    
+        # Partition claimed refs into verified vs phantom
+        verified_refs = []
+        phantom_refs = []
+        
+        for ref in claimed_refs:
+            if ref in remote_refs:
+                verified_refs.append(ref)
+            else:
+                phantom_refs.append(ref)
+                
+        return verified_refs, phantom_refs
+        
+    except subprocess.TimeoutExpired:
+        # Edge case 2: network timeout - don't block
+        logger.warning(f"git ls-remote timed out, allowing completion anyway")
+        return claimed_refs, []
+    except Exception as e:
+        # Edge case 2: other git errors - don't block  
+        logger.warning(f"git ls-remote error, allowing completion anyway: {e}")
+        return claimed_refs, []
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3139,6 +3293,20 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: verify push refs BEFORE the main write txn. A rejected
+    # completion still needs an auditable event, so we emit it in a 
+    # tiny dedicated txn, then raise. This function never mutates 
+    # task state on a phantom-push rejection.
+    verified_refs, phantom_refs = _verify_push_refs(task_id, metadata, summary)
+    if phantom_refs:
+        summary_preview = (
+            (summary or result or "").strip().splitlines()[0][:200]
+            if (summary or result)
+            else None
+        )
+        record_phantom_push_block(conn, task_id, phantom_refs, summary_preview)
+        raise PhantomPushError(phantom_refs, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:
@@ -3563,9 +3731,24 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
+    # Gate: verify push refs BEFORE the main write txn. A rejected
+    # block still needs an auditable event, so we emit it in a 
+    # tiny dedicated txn, then raise. This function never mutates 
+    # task state on a phantom-push rejection.
+    verified_refs, phantom_refs = _verify_push_refs(task_id, metadata, reason)
+    if phantom_refs:
+        summary_preview = (
+            (reason or "").strip().splitlines()[0][:200]
+            if reason
+            else None
+        )
+        record_phantom_push_block(conn, task_id, phantom_refs, summary_preview)
+        raise PhantomPushError(phantom_refs, task_id)
+        
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(

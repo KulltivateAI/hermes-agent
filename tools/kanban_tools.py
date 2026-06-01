@@ -31,11 +31,120 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
 from typing import Any, Optional
 
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phantom Push Verification
+# ---------------------------------------------------------------------------
+
+def _verify_push_claims(
+    task_id: str, 
+    summary: Optional[str], 
+    metadata: Optional[dict]
+) -> tuple[list[str], list[str]]:
+    """Verify claimed push refs against git ls-remote origin.
+    
+    Returns (verified_refs, phantom_refs). On network/git failure,
+    logs a warning but treats all refs as verified to avoid blocking
+    completions during transient issues.
+    
+    Architecture: git calls only in tool layer, DB layer stays git-free.
+    """
+    if not metadata:
+        return [], []
+    
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not workspace or not os.path.isdir(workspace):
+        # Edge case 1: No git remote / detached / scratch with no repo 
+        # → SKIP the check entirely, never block.
+        logger.debug(f"No workspace or not a directory: {workspace}, skipping phantom push check")
+        return [], []
+    
+    # Extract explicit metadata claims (BLOCKING tier)
+    claimed_refs = []
+    if metadata.get("branch"):
+        claimed_refs.append(metadata["branch"])
+    if metadata.get("pushed_sha") or metadata.get("sha") or metadata.get("commit"):
+        sha = metadata.get("pushed_sha") or metadata.get("sha") or metadata.get("commit")
+        claimed_refs.append(sha)
+    # PR URL ref resolution would go here if needed
+    
+    if not claimed_refs:
+        # Prose scan for advisory warnings (not blocking)
+        if summary:
+            # Look for "pushed", "git push", 7-40 hex SHAs, PR urls in prose
+            prose_patterns = [
+                r'\bpushed\b',
+                r'\bgit push\b',
+                r'\b[0-9a-f]{7,40}\b',  # hex SHAs
+                r'github\.com/[^/]+/[^/]+/pull/\d+',  # PR URLs
+            ]
+            for pattern in prose_patterns:
+                if re.search(pattern, summary, re.IGNORECASE):
+                    # Could emit suspected_phantom_push advisory event here
+                    # but tests specify this as advisory-only (no blocking)
+                    logger.info(f"Detected potential push references in prose but not blocking: {task_id}")
+                    break
+        return [], []
+    
+    # Run git ls-remote to verify explicit claims
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "origin"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode != 0:
+            # Edge case 2: ls-remote NETWORK/transient failure 
+            # → do NOT hard-block. Advisory-warn + ALLOW completion
+            logger.warning(
+                f"git ls-remote failed (exit {result.returncode}), "
+                f"allowing completion anyway: {result.stderr.strip()}"
+            )
+            return claimed_refs, []  # treat all as verified
+            
+        # Parse ls-remote output: "SHA\trefs/heads/branch" or "SHA\tHEAD"
+        remote_refs = set()
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if '\t' in line:
+                sha, ref = line.split('\t', 1)
+                remote_refs.add(sha.strip())  # Add SHA
+                # Add branch name if it's a heads ref
+                if ref.startswith('refs/heads/'):
+                    branch_name = ref[len('refs/heads/'):]
+                    remote_refs.add(branch_name)
+                    
+        # Partition claimed refs into verified vs phantom
+        verified_refs = []
+        phantom_refs = []
+        
+        for ref in claimed_refs:
+            if ref in remote_refs:
+                verified_refs.append(ref)
+            else:
+                phantom_refs.append(ref)
+                
+        return verified_refs, phantom_refs
+        
+    except subprocess.TimeoutExpired:
+        # Edge case 2: network timeout - don't block
+        logger.warning(f"git ls-remote timed out, allowing completion anyway")
+        return claimed_refs, []
+    except Exception as e:
+        # Edge case 2: other git errors - don't block  
+        logger.warning(f"git ls-remote error, allowing completion anyway: {e}")
+        return claimed_refs, []
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +578,18 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Phantom push verification gate - runs BEFORE DB mutations
+            verified_refs, phantom_refs = _verify_push_claims(tid, summary, metadata)
+            if phantom_refs:
+                # Emit audit event via helper and raise PhantomPushError
+                summary_preview = (
+                    (summary or result or "").strip().splitlines()[0][:200]
+                    if (summary or result)
+                    else None
+                )
+                kb.record_phantom_push_block(conn, tid, phantom_refs, summary_preview)
+                raise kb.PhantomPushError(phantom_refs, tid)
+            
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -495,6 +616,18 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.PhantomPushError as phantom_err:
+                # Structured rejection — surface the phantom refs so the
+                # worker can retry after actually pushing the refs or
+                # removing the unverified claims from metadata.
+                # Audit event already landed in the DB.
+                return tool_error(
+                    f"kanban_complete blocked: the following push refs "
+                    f"are not present on origin: {', '.join(phantom_err.phantom)}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Either (a) actually push the branch/SHA then retry, or "
+                    f"(b) drop the unverified refs from metadata then retry."
                 )
             if not ok:
                 return tool_error(

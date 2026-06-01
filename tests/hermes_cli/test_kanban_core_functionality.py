@@ -4605,6 +4605,11 @@ def test_complete_with_phantom_branch_blocks(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as kb
     import subprocess
     import pytest
+    import tempfile
+    
+    # Set up workspace environment
+    workspace = tempfile.mkdtemp()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", workspace)
     
     # Mock git ls-remote to return empty (simulating phantom branch)
     def mock_run(*args, **kwargs):
@@ -4643,6 +4648,9 @@ def test_complete_with_phantom_branch_blocks(kanban_home, monkeypatch):
         assert "completed" not in kinds
     finally:
         conn.close()
+        # Clean up temp workspace
+        import shutil
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_complete_with_no_git_remote_skips_check(kanban_home, monkeypatch):
@@ -4728,6 +4736,11 @@ def test_block_task_with_phantom_push_also_gated(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as kb
     import subprocess
     import pytest
+    import tempfile
+    
+    # Set up workspace environment
+    workspace = tempfile.mkdtemp()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", workspace)
     
     # Mock git ls-remote to return empty
     def mock_run(*args, **kwargs):
@@ -4764,6 +4777,9 @@ def test_block_task_with_phantom_push_also_gated(kanban_home, monkeypatch):
         assert "blocked" not in kinds
     finally:
         conn.close()
+        # Clean up temp workspace
+        import shutil
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_complete_prose_only_phantom_is_advisory(kanban_home, monkeypatch):
@@ -4844,6 +4860,11 @@ def test_phantom_push_can_retry_after_rejection(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as kb
     import subprocess
     import pytest
+    import tempfile
+    
+    # Set up workspace environment
+    workspace = tempfile.mkdtemp()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", workspace)
     
     # First call: phantom (empty ls-remote)
     # Second call: verified (ls-remote returns refs)
@@ -4897,6 +4918,9 @@ def test_phantom_push_can_retry_after_rejection(kanban_home, monkeypatch):
         assert kinds.count("completed") == 1
     finally:
         conn.close()
+        # Clean up temp workspace
+        import shutil
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4917,7 +4941,9 @@ def test_kanban_complete_tool_phantom_push_returns_error(kanban_home, monkeypatc
     monkeypatch.setattr("subprocess.run", mock_run)
     
     # Mock HERMES_KANBAN_WORKSPACE and other env vars
-    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/fake-workspace")
+    import tempfile
+    workspace = tempfile.mkdtemp()
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", workspace)
     
     # Create a test task
     import hermes_cli.kanban_db as kb
