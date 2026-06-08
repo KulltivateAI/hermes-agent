@@ -834,12 +834,20 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except kanban_db.OpenPRCompletionError as open_err:
+                    # Handoff says the referenced PR is still open/unmerged.
+                    # The task was already moved to blocked (review-required)
+                    # inside complete_task; surface a clean 409 instead of a
+                    # 500 so the dashboard shows why the drag-to-done was
+                    # refused. Merge the PR first, then complete.
+                    raise HTTPException(status_code=409, detail=str(open_err))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1177,12 +1185,21 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                            )
+                        except kanban_db.OpenPRCompletionError as open_err:
+                            # Handoff says the referenced PR is still
+                            # open/unmerged; the task was moved to blocked
+                            # inside complete_task. Record per-item so the
+                            # rest of the bulk batch still processes.
+                            entry.update(ok=False, error=str(open_err))
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":

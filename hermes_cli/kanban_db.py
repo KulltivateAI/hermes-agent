@@ -3512,7 +3512,13 @@ _OPEN_PR_RE = re.compile(
     r"\bPR\s+#(\d+)\b[ \t]*"
     r"(?:is|are|still|currently|remains?|=)?[ \t]*"
     r"(?:still[ \t]+|currently[ \t]+|yet[ \t]+)?"
-    r"(?:open|unmerged|not[ \t-]+(?:yet[ \t]+)?merged)\b",
+    r"(?:"
+    # "open" — but NOT "open for discussion / open to feedback", which
+    # describe a review/discussion state rather than unmerged code.
+    r"open\b(?![ \t]+(?:for|to)\b)"
+    r"|unmerged\b"
+    r"|not[ \t-]+(?:yet[ \t]+)?merged\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -3521,9 +3527,17 @@ _OPEN_PR_RE = re.compile(
 # than a current-state assertion, so the completion proceeds. Only positive
 # merge phrasings are listed — "unmerged" / "not merged" are intentionally
 # absent so they can't accidentally clear an open-PR assertion.
+#
+# The ``(?<!be )`` negative lookbehind on the ``merged to/into`` alternative
+# rejects FUTURE / IMPERATIVE intent ("will be merged to main", "needs to be
+# merged into main", "should be merged") — those are unshipped-work handoffs,
+# NOT merge confirmations, and must not clear the open-PR guard. Past-tense
+# "has been merged" still matches via its own alternative ("been merged", not
+# "be merged"), and "merged to main" / "squash-merged" stay genuine
+# confirmations.
 _MERGE_CONFIRM_RE = re.compile(
     r"\b(?:squash[\s-]?merged|merge[\s-]?commit|"
-    r"merged\s+(?:to|into|at|in|via)|successfully\s+merged|"
+    r"(?<!be )(?<!not )merged\s+(?:to|into|at|in|via)|successfully\s+merged|"
     r"now\s+merged|has\s+been\s+merged|was\s+merged|auto[\s-]?merged)\b",
     re.IGNORECASE,
 )

@@ -54,6 +54,22 @@ def kanban_home(tmp_path, monkeypatch):
         (None, None),
         # A merged-only handoff with no open assertion → not detected.
         ("PR #860 squash-merged to main, branch deleted", None),
+        # --- review-finding regressions (commit follow-up) ---------------
+        # FUTURE / IMPERATIVE merge intent must NOT count as a merge
+        # confirmation — these are unshipped-work handoffs and must be
+        # detected as still-open (fail-safe direction).
+        ("PR #880 still open, needs to be merged into main", 880),
+        ("PR #881 is OPEN but will be merged to main next sprint", 881),
+        ("PR #882 is open; should be merged into main after review", 882),
+        # "open for discussion / open to feedback" describes a review state,
+        # not unmerged code → NOT detected (no false re-block).
+        ("PR #883 is open for discussion", None),
+        ("PR #884 open to feedback from the team", None),
+        ("PR #885 is open for review", None),
+        # ...but "not merged to main" is a genuine open assertion and the
+        # for/to exclusion must NOT swallow it (fail-safe direction).
+        ("PR #886 is not merged to main yet", 886),
+        ("PR #887 unmerged to main", 887),
     ],
 )
 def test_detect_open_pr_in_handoff(text, expected):
