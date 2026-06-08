@@ -526,6 +526,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--allow-open-pr", action="store_true",
+                            dest="allow_open_pr",
+                            help="Bypass the open-PR completion guard. By default, if the "
+                                 "handoff summary/result says the referenced PR is still "
+                                 "open/unmerged, the task is moved to blocked (review-required) "
+                                 "instead of done. Pass this when the completion is genuinely "
+                                 "terminal (e.g. the summary narrates an open PR for a separate "
+                                 "follow-up task).")
 
     p_edit = sub.add_parser(
         "edit",
@@ -1907,13 +1915,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    allow_open_pr=getattr(args, "allow_open_pr", False),
+                )
+            except kb.OpenPRCompletionError as open_err:
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: handoff says PR "
+                    f"#{open_err.pr_number} is still open/unmerged — task "
+                    f"moved to blocked (review-required) instead of done. "
+                    f"Merge the PR first, or re-run with --allow-open-pr if "
+                    f"the completion is genuinely terminal.",
+                    file=sys.stderr,
+                )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

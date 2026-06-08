@@ -580,6 +580,27 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.OpenPRCompletionError as open_err:
+                # Handoff admits the referenced PR is still open/unmerged.
+                # The task was moved to blocked (review-required) instead
+                # of done — completing it would report unshipped work as
+                # shipped. Tell the worker the real state so it doesn't
+                # retry in a loop: get the PR merged (or have a reviewer
+                # merge it), THEN the task can be completed; or if the PR
+                # genuinely landed and the summary was just narrating
+                # prior state, rephrase to confirm the merge.
+                return tool_error(
+                    f"kanban_complete redirected to BLOCKED: your handoff says "
+                    f"PR #{open_err.pr_number} is still open/unmerged, so the "
+                    f"task was moved to blocked (review-required) rather than "
+                    f"marked done — auto-completing it would report unshipped "
+                    f"work as shipped. Next: get PR #{open_err.pr_number} "
+                    f"merged (or escalate to a reviewer to merge it), then the "
+                    f"task can be completed. If the PR is actually merged and "
+                    f"your summary was narrating prior state, re-run "
+                    f"kanban_complete with a summary that confirms the merge "
+                    f"(e.g. 'squash-merged to main')."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

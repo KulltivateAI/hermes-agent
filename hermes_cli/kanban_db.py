@@ -3502,6 +3502,77 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# Present-tense assertion that a PR is still open / unmerged, e.g.
+#   "PR #836 is OPEN", "PR #831 still open", "PR #837 unmerged",
+#   "PR #840 is not yet merged".
+# Deliberately does NOT match past-tense "PR #836 was OPEN" so a genuine
+# merge handoff that narrates prior state ("PR #836 was OPEN but BEHIND,
+# squash-merged to main") is not misread as still-open.
+_OPEN_PR_RE = re.compile(
+    r"\bPR\s+#(\d+)\b[ \t]*"
+    r"(?:is|are|still|currently|remains?|=)?[ \t]*"
+    r"(?:still[ \t]+|currently[ \t]+|yet[ \t]+)?"
+    r"(?:open|unmerged|not[ \t-]+(?:yet[ \t]+)?merged)\b",
+    re.IGNORECASE,
+)
+
+# Positive confirmation that a merge actually happened. When present in the
+# same handoff, an open-PR mention is treated as historical narration rather
+# than a current-state assertion, so the completion proceeds. Only positive
+# merge phrasings are listed — "unmerged" / "not merged" are intentionally
+# absent so they can't accidentally clear an open-PR assertion.
+_MERGE_CONFIRM_RE = re.compile(
+    r"\b(?:squash[\s-]?merged|merge[\s-]?commit|"
+    r"merged\s+(?:to|into|at|in|via)|successfully\s+merged|"
+    r"now\s+merged|has\s+been\s+merged|was\s+merged|auto[\s-]?merged)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_open_pr_in_handoff(text: Optional[str]) -> Optional[int]:
+    """Return the number of a PR a handoff admits is still open/unmerged.
+
+    Returns the first such PR number, or ``None`` when the text contains no
+    present-tense open-PR assertion (or contains one but also confirms a
+    merge happened, in which case the open mention is historical).
+
+    This is the detector behind the ``complete_task`` guard that re-blocks
+    dead-worker / sweep completions whose summary says the referenced PR
+    never merged (#false-completion class bug).
+    """
+    if not text:
+        return None
+    m_open = _OPEN_PR_RE.search(text)
+    if m_open is None:
+        return None
+    # A merge confirmation anywhere in the same handoff overrides: the open
+    # mention is narrating prior state, not the current one.
+    if _MERGE_CONFIRM_RE.search(text):
+        return None
+    return int(m_open.group(1))
+
+
+class OpenPRCompletionError(ValueError):
+    """Raised by ``complete_task`` when the handoff summary asserts the
+    referenced PR is still open/unmerged.
+
+    The task is transitioned to ``blocked`` (review-required) instead of
+    ``done`` before this is raised — so the caller's "completion" is
+    honestly recorded as needing a human merge gate, not silently shipped.
+    The PR number is attached as ``.pr_number``. Kept as a ``ValueError``
+    subclass so existing tool-error handlers treat it as recoverable.
+    """
+
+    def __init__(self, pr_number: int, completing_task_id: str):
+        self.pr_number = int(pr_number)
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            f"completion redirected to blocked: handoff says PR "
+            f"#{pr_number} is still open/unmerged — task {completing_task_id} "
+            f"moved to blocked (review-required) instead of done"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3511,6 +3582,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    allow_open_pr: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3539,6 +3611,16 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    ``allow_open_pr`` (default ``False``) controls the open-PR completion
+    guard. When the handoff summary/result asserts the referenced PR is
+    still open/unmerged (present tense, no merge confirmation), the task
+    is transitioned to ``blocked`` (review-required) instead of ``done``
+    and :class:`OpenPRCompletionError` is raised. This stops a dead-worker
+    reconcile sweep, a manual CLI completion, or a worker itself from
+    reporting unshipped work as shipped. Pass ``allow_open_pr=True`` to
+    bypass (e.g. a deliberate completion that narrates an open PR for a
+    follow-up task that is genuinely terminal).
     """
     now = int(time.time())
 
@@ -3568,6 +3650,60 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Open-PR completion guard (#false-completion class bug).
+    #
+    # A worker (or a dead-worker reconcile sweep, or a manual CLI
+    # completion) can hand off a summary that admits the referenced PR is
+    # still open/unmerged — e.g. "Worker (pid None) dead, PR #836 is OPEN"
+    # or a worker's own "review-required: PR #831 still open". Marking such
+    # a task ``done`` reports unshipped work as shipped: the board says it
+    # merged while production-main never got the change.
+    #
+    # Detect a present-tense open-PR assertion (past-tense narration like
+    # "PR #836 was OPEN but squash-merged" is allowed through via the
+    # merge-confirmation override). When found, transition the task to
+    # ``blocked`` (review-required) instead of ``done`` and raise so the
+    # caller surfaces the redirect. This is the single choke-point that
+    # catches every completion path — agent tool, reconcile sweep, and the
+    # ``hermes kanban complete`` CLI — rather than patching one of them.
+    if not allow_open_pr:
+        open_pr = _detect_open_pr_in_handoff(
+            " ".join(filter(None, [summary, result]))
+        )
+        if open_pr is not None:
+            block_reason = (
+                f"review-required: worker handoff says PR #{open_pr} is "
+                f"still open/unmerged — re-blocked instead of auto-completed "
+                f"so the merge gate isn't skipped"
+            )
+            blocked_ok = block_task(
+                conn, task_id,
+                reason=block_reason,
+                expected_run_id=expected_run_id,
+            )
+            # Record the redirect for audit whether or not block_task
+            # actually flipped state. block_task only transitions
+            # running|ready -> blocked, so a task that was ALREADY blocked
+            # (the real dead-worker incident: a review-required block
+            # followed by a reconcile-sweep complete) returns False here —
+            # but it's already in the desired terminal state, and raising
+            # below still prevents the blocked -> done transition. Either
+            # way the operator gets the event.
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_redirected_open_pr",
+                    {
+                        "pr_number": open_pr,
+                        "reblocked": bool(blocked_ok),
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise OpenPRCompletionError(open_pr, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:
