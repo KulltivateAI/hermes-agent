@@ -584,12 +584,27 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
 
 
 def _create_thread(
-    token: str, channel_id: str, name: str,
+    token: str, channel_id: str, name: str = "",
     message_id: Optional[str] = None,
     auto_archive_duration: int = 1440,
     **_kwargs: Any,
 ) -> str:
-    """Create a thread in a channel."""
+    """Create a thread in a channel, optionally with durable escalation receipts."""
+    if _kwargs.get("for_agent") is not None:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import read_raw_config_readonly
+        from tools.discord_escalation import create_agent_thread
+
+        home = get_hermes_home()
+        cfg = read_raw_config_readonly()
+        discord_cfg = cfg.get("discord", {})
+        policy = discord_cfg.get("escalation_threads", {}) if isinstance(discord_cfg, dict) else discord_cfg
+        return json.dumps(create_agent_thread(
+            token=token, request=_discord_request, home=home, policy=policy,
+            channel_id=channel_id, name=name, auto_archive_duration=auto_archive_duration,
+            **{key: _kwargs[key] for key in ("for_agent", "issue_key", "summary", "severity",
+               "body", "requester_id", "existing_thread_id", "retry", "reconcile")},
+        ))
     if message_id:
         # Create thread from an existing message
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
@@ -669,7 +684,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("pin_message", "(channel_id, message_id)", "pin a message"),
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
-    ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_thread", "(channel_id, name?, for_agent?, issue_key?, summary?, severity?, body?, requester_id?, existing_thread_id?, retry?, reconcile?)", "ordinary public thread or opt-in requester-owned escalation; existing_thread_id adopts without a body; uncertain sends require exact ID reconciliation"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -873,6 +888,27 @@ def _build_schema(
         },
     }
 
+    if "create_thread" in actions:
+        properties.update({
+            "for_agent": {"type": "string", "description": "Recipient bot ID; opts create_thread into requester-owned escalation."},
+            "issue_key": {"type": "string", "description": "Stable incident key (1..128 ASCII letters/digits or ._:/-); repeat identical input for replay."},
+            "summary": {"type": "string", "description": "Terse single-line, mention-free C1 anchor summary; required for create, absent for adoption."},
+            "severity": {"type": "string", "enum": ["warning", "critical"], "description": "Create anchor severity; defaults to warning. Absent for adoption."},
+            "body": {"type": "string", "description": "Exact nonblank first body, only in thread; recipient mention plus newline plus body must fit 2000 characters. Absent for adoption."},
+            "requester_id": {"type": "string", "description": "Optional additional member ID; does not change authenticated sender identity."},
+            "existing_thread_id": {"type": "string", "description": "Adopt a known public thread without sending; omit name/summary/severity/body."},
+            "retry": {"type": "boolean", "description": "Explicit same-input retry after definitive rejection/membership failure; never bypasses POST uncertainty."},
+            "reconcile": {
+                "type": "object", "additionalProperties": False, "minProperties": 1,
+                "description": "Positive exact-ID proofs for uncertain attempted POSTs; read-only remotely. Cannot combine with retry. Resume normally after pending result.",
+                "properties": {
+                    "anchor_message_id": {"type": "string"},
+                    "thread_id": {"type": "string"},
+                    "body_message_id": {"type": "string"},
+                },
+            },
+        })
+
     return {
         "name": tool_name,
         "description": description,
@@ -998,6 +1034,15 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = 1440,
+    for_agent: Optional[str] = None,
+    issue_key: Optional[str] = None,
+    summary: Optional[str] = None,
+    severity: Optional[str] = None,
+    body: Optional[str] = None,
+    requester_id: Optional[str] = None,
+    existing_thread_id: Optional[str] = None,
+    retry: bool = False,
+    reconcile: Optional[dict] = None,
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1031,7 +1076,17 @@ def _run_discord_action(
         "name": name,
     }
 
-    missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
+    c2_supplied = any(v is not None for v in (
+        for_agent, issue_key, summary, severity, body, requester_id, existing_thread_id, reconcile,
+    )) or retry is not False
+    if c2_supplied and (action != "create_thread" or for_agent is None):
+        return tool_error("Escalation arguments require create_thread with for_agent.")
+    if for_agent is not None and message_id:
+        return tool_error("Escalation mode forbids message_id; use reconcile with exact proof IDs.")
+    required = _REQUIRED_PARAMS.get(action, [])
+    if action == "create_thread" and for_agent is not None:
+        required = ["channel_id"] if existing_thread_id is not None else ["channel_id", "name"]
+    missing = [p for p in required if not local_vars.get(p)]
     if missing:
         return tool_error(
             f"Missing required parameters for '{action}': {', '.join(missing)}"
@@ -1051,6 +1106,15 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            for_agent=for_agent,
+            issue_key=issue_key,
+            summary=summary,
+            severity=severity,
+            body=body,
+            requester_id=requester_id,
+            existing_thread_id=existing_thread_id,
+            retry=retry,
+            reconcile=reconcile,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -1080,6 +1144,8 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "for_agent": None, "issue_key": None, "summary": None, "severity": None, "body": None,
+    "requester_id": None, "existing_thread_id": None, "retry": False, "reconcile": None,
 }
 
 

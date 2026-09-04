@@ -10,6 +10,105 @@ Hermes Agent integrates with Discord as a bot, letting you chat with your AI ass
 
 Before setup, here's the part most people want to know: how Hermes behaves once it's in your server.
 
+## Requester-owned escalation threads (opt-in)
+
+The requesting agent calls the existing `discord` tool itself, using its own
+active profile and bot token. Do not relay routine thread creation through Ops,
+the recipient, or another agent. Ordinary `create_thread` calls are unchanged.
+
+This feature is **disabled by default**:
+
+```yaml
+discord:
+  escalation_threads:
+    enabled: false
+    observer_ids: []
+```
+
+Only enable through your rollout owner after C1 receiver trust and channel
+admission have been verified. An enabled policy needs at least one observer ID;
+include your designated human escalation owner. This does not enroll receiving
+agents, bypass their allowlists, or change busy-notice wire-channel policy.
+
+Example tool arguments (substitute your actual numeric IDs):
+
+```json
+{
+  "action": "create_thread",
+  "channel_id": "100",
+  "name": "Issue requiring review",
+  "for_agent": "22",
+  "issue_key": "incident:stable-key",
+  "summary": "Review needed",
+  "severity": "warning",
+  "body": "Exact issue details and evidence: https://example.invalid/evidence",
+  "requester_id": "44"
+}
+```
+
+`for_agent` selects escalation mode. The caller creates a navigation-only C1
+anchor in the GUILD_TEXT parent, a public thread anchored to that message, then
+explicitly joins/adds and individually verifies every required member before
+posting the first body. Members include the authenticated sender, recipient,
+optional additional requester and configured observers (maximum 16 deduped IDs).
+The optional `requester_id` never changes transport identity. Only the recipient
+is pinged. The body is exactly `<@recipient>` plus newline plus the caller's body,
+limited to 2000 total characters; it is never trimmed, chunked or mirrored to the
+parent. Summary/name must be single-line and mention-free. Sender needs access,
+message history, embed/send, public-thread creation and thread/member permissions.
+No privileged members intent is required for individual membership verification.
+
+To reuse a known canonical public thread **without sending a body**, supply
+`existing_thread_id`, `channel_id`, `for_agent` and `issue_key`; omit name,
+summary, severity and body. This immutable adoption mode returns `thread_ready`,
+never delivery. It does not require a C1 starter or the same original creator.
+It cannot replace a create receipt under the same key.
+
+### Receipts, retries and operator recovery
+
+Receipts live in `discord_escalation_receipts.db` under the **active profile's**
+Hermes home, not the global session database. Preserve/back up this file and its
+SQLite state. It stores immutable input metadata and a SHA-256 body hash, not the
+body or token. Repeat exactly the same input, including body whitespace, when
+replaying, retrying or reconciling. Token rotation to the same bot is supported;
+a different bot or changed immutable input conflicts. Observer additions are
+retained; removing an observer from current policy does not erase old obligations.
+
+- `delivered`: exact HTTP body acknowledgment plus committed receipt and verified
+  membership. This is **not** recipient pickup, execution or goal registration.
+- `reused`: prior create delivery, membership verified/repaired this invocation,
+  no new POST. Deleted bodies are not resent automatically.
+- `thread_ready`: bodyless adoption with memberships verified, no delivery claim.
+- A definitive rejection or membership failure needs explicit `retry: true` after
+  correction; respect `retry_after_seconds`. No internal resend/sleep loop.
+- `reconciliation_required`: a POST may have succeeded or still be running. Never
+  blindly retry, delete/reset its receipt, change the issue key to escape it, or
+  search by title. First wait for/stop the originating attempt through your normal
+  operator procedure, then supply positive exact-ID proofs on the same request:
+
+```json
+{"reconcile": {"anchor_message_id": "1001"}}
+```
+
+Use `thread_id` for uncertain thread creation (it equals the anchor ID), or
+`body_message_id` for uncertain body delivery. These are an optional object on the
+same original create request, not a new action. Reconciliation performs GETs only,
+validates all supplied proofs before one atomic receipt update, and never sends
+messages or adds members. Never-attempted-stage proofs and mismatched IDs/content
+are rejected; a 404 is not proof of non-delivery. Successful reconciliation returns
+`pending`, `success: false`, `next_action: resume` even if it proves historic body
+delivery. Repeat normally afterward to verify memberships and continue safely.
+
+Errors preserve known IDs and historic `body_delivered` separately from current
+`success`. A failed local acknowledgment commit returns `receipt_persisted: false`
+and known IDs for recovery, never a delivery claim. Archived/locked/deleted threads
+require manual correction, never automatic replacement/unarchiving. Unrecoverable
+uncertainty may remain blocked indefinitely. Lost receipts or cloned profiles on
+another machine cannot provide global exactly-once delivery.
+
+This API does not add CLI flags, migrate producers, install profiles, or certify
+fleet rollout; installation, receiver canaries and later enablement remain separate.
+
 ## How Hermes Behaves
 
 | Context | Behavior |
