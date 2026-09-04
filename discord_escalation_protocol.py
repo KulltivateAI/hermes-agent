@@ -69,7 +69,9 @@ def is_trusted_nonconversational_message(message, trusted_sender_ids) -> bool:
         content = _get(message, "content")
         if content is not None and (not isinstance(content, str) or content != ""):
             return False
-        if any(_get(message, key) for key in ("attachments", "stickers", "sticker_items", "components")):
+        if any(_get(message, key) for key in (
+            "attachments", "stickers", "sticker_items", "components", "poll", "message_snapshots",
+        )):
             return False
         embeds = _get(message, "embeds")
         if not isinstance(embeds, (list, tuple)) or len(embeds) != 1:
