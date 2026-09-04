@@ -423,6 +423,15 @@ class _Attempt:
                     raise ValueError("thread must equal anchor")
                 if row["stage"] == "complete" and row["body_message_id"] is None:
                     raise ValueError("complete requires delivery evidence")
+                # Only the corresponding ambiguous stage may retain an unproved
+                # candidate. Earlier stages must never resume past later evidence.
+                stage = row["stage"]
+                if row["anchor_message_id"] is not None and stage.startswith("anchor_") and stage != "anchor_ambiguous":
+                    raise ValueError("anchor evidence precedes its allowed stage")
+                if row["thread_id"] is not None and (stage.startswith("anchor_") or (stage.startswith("thread_") and stage != "thread_ambiguous")):
+                    raise ValueError("thread evidence precedes its allowed stage")
+                if row["body_message_id"] is not None and stage not in ("body_ambiguous", "complete"):
+                    raise ValueError("body evidence precedes its allowed stage")
             stored = json.loads(row["input_json"])
             members = json.loads(self.row["required_members_json"])
             if not isinstance(stored, dict) or not isinstance(members, list) or not members:
@@ -442,6 +451,10 @@ class _Attempt:
                 raise ValueError("receipt lost immutable member obligations")
             if self.row["mode"] == "create" and stored["body_sha256"] != self.row["body_sha256"]:
                 raise ValueError("receipt body hash columns disagree")
+            if row["mode"] == "adopt":
+                adopted = stored["existing_thread_id"]
+                if adopted != snowflake(adopted) or adopted != row["thread_id"]:
+                    raise ValueError("adopted thread differs from immutable input")
             if members != sorted({snowflake(v) for v in members}) or len(members) > 16:
                 raise ValueError("malformed member obligations")
         except (ValueError, TypeError, KeyError) as exc:
