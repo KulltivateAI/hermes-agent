@@ -1999,6 +1999,7 @@ DEFAULT_CONFIG = {
 
     # Discord platform settings (gateway mode)
     "discord": {
+        "escalation_threads": {"enabled": False, "observer_ids": []},
         "nonconversational_sender_ids": [],  # Trusted bot IDs for inert protocol messages
         "nonconversational_wire_channels": [],  # Exact targets activated for busy ACK envelopes
         "require_mention": True,       # Require @mention to respond in server channels

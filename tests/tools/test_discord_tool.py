@@ -45,6 +45,39 @@ def _mock_urlopen(response_data, status=200):
 # Token / check_fn
 # ---------------------------------------------------------------------------
 
+class TestEscalationPublicContract:
+    def test_schema_fields_and_admin_split(self):
+        from tools import discord_tool as dt
+        fields = {"for_agent", "issue_key", "summary", "severity", "body", "requester_id",
+                  "existing_thread_id", "retry", "reconcile"}
+        for schema in (dt._STATIC_CORE_SCHEMA, dt._build_schema(["create_thread"], {"has_members_intent": False})):
+            assert fields <= set(schema["parameters"]["properties"])
+            assert schema["parameters"]["required"] == ["action"]
+        assert not fields & set(dt._STATIC_ADMIN_SCHEMA["parameters"]["properties"])
+        assert not fields & set(dt._build_schema(["fetch_messages"])["parameters"]["properties"])
+
+    def test_non_create_and_missing_opt_in_reject_payload(self, monkeypatch):
+        from tools import discord_tool as dt
+        from tools.registry import registry
+        monkeypatch.setattr(dt, "_get_bot_token", lambda: "synthetic")
+        monkeypatch.setattr(dt, "_load_allowed_actions_config", lambda: None)
+        with patch.object(dt, "_discord_request") as request:
+            for args in ({"action": "fetch_messages", "channel_id": "100", "body": "payload"},
+                         {"action": "create_thread", "channel_id": "100", "name": "ordinary", "body": "payload"}):
+                assert "error" in json.loads(registry._tools["discord"].handler(args))
+            request.assert_not_called()
+
+    def test_allowlist_rejects_stale_escalation_schema(self, monkeypatch):
+        from tools import discord_tool as dt
+        from tools.registry import registry
+        monkeypatch.setattr(dt, "_get_bot_token", lambda: "synthetic")
+        monkeypatch.setattr(dt, "_load_allowed_actions_config", lambda: ["fetch_messages"])
+        with patch.object(dt, "_discord_request") as request:
+            result = json.loads(registry._tools["discord"].handler({"action": "create_thread", "for_agent": "22"}))
+            assert "disabled by config" in result["error"]
+            request.assert_not_called()
+
+
 class TestCheckRequirements:
     @pytest.mark.parametrize("token, expected", [(None, False), ("test-token-123", True)])
     def test_requirements_follow_token(self, monkeypatch, token, expected):
