@@ -24,11 +24,35 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
-
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # Use event commit objects, not branch names or the synthetic checkout merge.
+            # jq -e rejects missing, non-string and malformed SHAs before any Git input.
+            PR_BASE=$(jq -er '.pull_request.base.sha | select(type == "string") | select(test("^[0-9a-fA-F]{40}$"))' "$GITHUB_EVENT_PATH")
+            PR_HEAD=$(jq -er '.pull_request.head.sha | select(type == "string") | select(test("^[0-9a-fA-F]{40}$"))' "$GITHUB_EVENT_PATH")
+            for sha in "$PR_BASE" "$PR_HEAD"; do
+              if ! git cat-file -e "$sha" 2>/dev/null; then
+                git fetch --no-tags origin "$sha"
+              fi
+              if [ "$(git cat-file -t "$sha")" != "commit" ]; then
+                echo "::error::PR attribution requires commit objects"
+                exit 1
+              fi
+            done
+            # Unrelated histories are not a valid PR range; do not audit all history.
+            git merge-base "$PR_BASE" "$PR_HEAD" >/dev/null
+            RANGE="${PR_BASE}..${PR_HEAD}"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # Preserve the existing push/main behavior (normally an empty range).
+            # Do not substitute event.before or introduce a main-history audit.
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+            RANGE="${MERGE_BASE}..HEAD"
+          else
+            echo "::error::Unsupported attribution event"
+            exit 1
+          fi
+          echo "Contributor attribution range: $RANGE"
+          NEW_EMAILS=$(git log "$RANGE" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

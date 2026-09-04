@@ -10026,6 +10026,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        if event.source.platform == Platform.DISCORD:
+            thread_meta = _non_conversational_metadata(thread_meta, platform=event.source.platform)
+            thread_meta["nonconversational_kind"] = "busy_ack"
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,

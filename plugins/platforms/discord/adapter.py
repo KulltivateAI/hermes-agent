@@ -33,6 +33,7 @@ from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
 from agent.display import ToolPreview
+from discord_escalation_protocol import build_busy_notice, is_trusted_nonconversational_message
 
 logger = logging.getLogger(__name__)
 
@@ -1024,6 +1025,26 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _normalize_nonconversational_ids(value, key) -> frozenset[str]:
+    """Invalid policy disables trust/emission rather than broadening it."""
+    if isinstance(value, list):
+        normalized = set()
+        for item in value:
+            if type(item) not in (str, int):
+                break
+            text = str(item)
+            if not text.isascii() or not text.isdecimal() or not text.lstrip("0"):
+                break
+            normalized.add(text.lstrip("0"))
+        else:
+            return frozenset(normalized)
+    logger.warning(
+        "Invalid discord.%s: expected a list of positive decimal IDs; disabling this policy for this adapter",
+        key,
+    )
+    return frozenset()
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -1062,6 +1083,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
+        self._nonconversational_sender_ids = _normalize_nonconversational_ids(
+            config.extra.get("nonconversational_sender_ids", []), "nonconversational_sender_ids"
+        )
+        self._nonconversational_wire_channels = _normalize_nonconversational_ids(
+            config.extra.get("nonconversational_wire_channels", []), "nonconversational_wire_channels"
+        )
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
@@ -1548,6 +1575,8 @@ class DiscordAdapter(BasePlatformAdapter):
         claim: bool,
     ) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
+        if is_trusted_nonconversational_message(message, self._nonconversational_sender_ids):
+            return False, False
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
@@ -2834,6 +2863,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
             return False
+        # Eligibility runs before recovered admission can prevent queued claims.
+        if is_trusted_nonconversational_message(message, self._nonconversational_sender_ids):
+            return False
         if self._discord_message_is_persistently_complete(str(getattr(message, "id", ""))):
             return False
         if self._discord_message_has_active_claim(str(getattr(message, "id", ""))):
@@ -2865,6 +2897,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
             try:
                 async for candidate in history(limit=25, after=getattr(message, "created_at", None), oldest_first=True):
+                    # An ACK/anchor reply does not complete the original request.
+                    if is_trusted_nonconversational_message(candidate, self._nonconversational_sender_ids):
+                        continue
                     author = getattr(candidate, "author", None)
                     if getattr(author, "id", None) != bot_id:
                         continue
@@ -3402,7 +3437,30 @@ class DiscordAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send normally, with a call-wide fallback veto for activated busy envelopes."""
+        # Exact destination only: a parent opt-in must never authorize a thread.
+        target = str((metadata or {}).get("thread_id") or chat_id)
+        busy_wire = (
+            (metadata or {}).get("nonconversational_kind") == "busy_ack"
+            and target in self._nonconversational_wire_channels
+        )
+        if busy_wire:
+            metadata = {**(metadata or {}), "notify": False}
+        result = await self._send_discord_message(chat_id, content, reply_to, metadata, busy_wire)
+        if busy_wire:
+            # Cover every failure, even before transport/channel resolution.
+            result.allow_formatting_fallback = False
+        return result
+
+    async def _send_discord_message(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        busy_wire: bool,
     ) -> SendResult:
         """Send a message to a Discord channel or thread.
 
@@ -3443,7 +3501,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
-            nonconversational = _metadata_marks_nonconversational(metadata)
+            nonconversational = busy_wire or _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
             if thread_id:
@@ -3460,6 +3518,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel = await self._client.fetch_channel(int(chat_id))
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+            if busy_wire:
+                kind = getattr(channel, "type", None)
+                kind = getattr(kind, "value", kind)
+                if type(kind) is not int or kind not in (0, 5, 10, 11):
+                    return SendResult(success=False, error="Busy wire target must be guild text/news or a public thread")
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -3482,13 +3546,17 @@ class DiscordAdapter(BasePlatformAdapter):
             reference = self._reply_reference_for_send(reply_to, channel)
 
             for i, chunk in enumerate(chunks):
+                payload = {"content": chunk}
+                if busy_wire:
+                    notice = build_busy_notice(chunk)
+                    payload = {"content": notice["content"], "embed": discord.Embed.from_dict(notice["embeds"][0])}
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
                     msg = await channel.send(
-                        content=chunk,
+                        **payload,
                         reference=chunk_reference,
                     )
                 except Exception as e:
@@ -3510,12 +3578,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                         reference = None
                         msg = await channel.send(
-                            content=chunk,
+                            **payload,
                             reference=None,
                         )
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if busy_wire:
+                    # A later chunk can fail; already-visible chunks remain inert.
+                    self._nonconversational_messages.mark_many([str(msg.id)])
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -6901,6 +6972,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 callers decide where to stop.
                 """
                 nonlocal has_unverified
+                if is_trusted_nonconversational_message(msg, self._nonconversational_sender_ids):
+                    return None
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return None
                 content = getattr(msg, "clean_content", msg.content) or ""
@@ -6964,6 +7037,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 after=_after_obj,
                 oldest_first=False,
             ):
+                # Own protocol notices/anchors are not conversational turns.
+                if is_trusted_nonconversational_message(msg, self._nonconversational_sender_ids):
+                    continue
                 # Non-conversational lifecycle/status bumps (self-improvement
                 # reviews, background-process notices, restart banners) must be
                 # skipped BEFORE the partition check — otherwise a delayed
@@ -10316,7 +10392,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
-    seeded_extra = {}
+    seeded_extra = {
+        # Always profile-local; explicit [] overrides nested policy. No env bridge.
+        key: discord_cfg[key] if key in discord_cfg else platform_extra_cfg.get(key, [])
+        for key in ("nonconversational_sender_ids", "nonconversational_wire_channels")
+    }
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only

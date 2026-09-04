@@ -458,3 +458,72 @@ async def test_iter_candidates_keeps_latest_messages_when_window_exceeds_limit(a
     assert got == [2, 3, 4]
 
 
+@pytest.mark.asyncio
+async def test_navigation_anchor_recovery_does_not_dispatch_and_neighbors_run_once(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setattr(discord, "MessageType", SimpleNamespace(default=0, reply=19))
+    adapter._nonconversational_sender_ids = frozenset({"42"})
+    anchor = make_bot_message(message_id=102, content="")
+    anchor.embeds = [{"title": "🟡 Needs a decision", "url": "https://hermes-agent.nousresearch.com/escalation-anchor/v1"}]
+    before = make_message(message_id=101)
+    after = make_message(message_id=103)
+    assert await adapter._dispatch_recovered_message(anchor) is False
+    adapter._handle_message.assert_not_awaited()
+    assert await adapter._should_backfill_discord_message(anchor) is False
+
+    # Real candidate iterator → persistent completion check → shared admission → handler.
+    class ReplayChannel(FakeChannel):
+        def history(self, *, limit, after=None, oldest_first=False, **kwargs):
+            messages = [
+                m for m in self._history_messages
+                if after is None or (
+                    m.id > after.id if hasattr(after, "id") else m.created_at > after
+                )
+            ]
+            messages.sort(key=lambda m: m.id, reverse=not oldest_first)
+            async def items():
+                for message in messages[:limit]:
+                    yield message
+            return items()
+
+    channel = ReplayChannel(history_messages=[before, anchor, after])
+    adapter._client.get_channel = lambda _: channel
+    for message in (before, anchor, after):
+        message.channel = channel
+    monkeypatch.setattr(adapter, "_missed_message_backfill_channels", lambda: {"123"})
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    from gateway.platforms.base import SendResult
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    del adapter._handle_message  # Restore the real handler after the ingress assertion.
+    processed = []
+    async def complete(event):
+        processed.append(int(event.message_id))
+        adapter._record_discord_response(
+            reply_to=event.message_id, result=SendResult(success=True, message_id="200"),
+            content="completed", final=True,
+        )
+    adapter.handle_message = complete
+    await adapter._run_missed_message_backfill()
+    await adapter._run_missed_message_backfill()
+    assert processed == [101, 103]
+    assert not adapter._discord_message_is_persistently_complete("102")
+    assert not adapter._discord_message_has_active_claim("102")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notice", [True, False])
+async def test_busy_reply_is_not_recovery_completion(adapter, monkeypatch, notice):
+    monkeypatch.setattr(discord, "MessageType", SimpleNamespace(default=0, reply=19))
+    adapter._nonconversational_sender_ids = frozenset({"999"})
+    reply = make_message(message_id=2, author_id=999, content="" if notice else "Done, substantive answer")
+    reply.author.bot = True
+    reply.type = 19
+    reply.reference = SimpleNamespace(message_id=1)
+    reply.mentions = [SimpleNamespace(id=42)]
+    reply.embeds = [{"description": "⚡ Working on it", "url": "https://hermes-agent.nousresearch.com/busy-notice/v1"}] if notice else []
+    channel = FakeChannel(history_messages=[reply])
+    original = make_message(message_id=1, channel=channel)
+    assert not adapter._discord_message_is_persistently_complete("1")
+    assert not adapter._discord_message_has_active_claim("1")
+    assert await adapter._should_backfill_discord_message(original) is notice

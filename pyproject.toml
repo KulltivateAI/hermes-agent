@@ -402,6 +402,7 @@ py-modules = [
   "cli",
   "hermes_bootstrap",
   "hermes_constants",
+  "discord_escalation_protocol",
   "hermes_state",
   "hermes_state_common",
   "hermes_state_portability",

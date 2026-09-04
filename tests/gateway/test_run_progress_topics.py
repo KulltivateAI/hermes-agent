@@ -1925,3 +1925,48 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [Platform.DISCORD, Platform.TELEGRAM])
+@pytest.mark.parametrize("policy", ["enabled", "master_disabled", "steer_disabled", "cooldown"])
+async def test_busy_ack_metadata_settings_and_cooldown(monkeypatch, platform, policy):
+    from unittest.mock import MagicMock
+    from gateway.platforms.base import build_session_key
+    from tests.gateway.test_busy_session_ack import _make_runner
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr("agent.onboarding.is_seen", lambda *_: True)
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false" if policy == "master_disabled" else "true")
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", "false" if policy == "steer_disabled" else "true")
+    runner, _ = _make_runner()
+    runner._busy_input_mode = "steer"
+    adapter = ProgressCaptureAdapter(platform)
+    runner.adapters[platform] = adapter
+    source = SessionSource(platform=platform, chat_id="100", chat_type="thread", thread_id="200", user_id="42")
+    event = MessageEvent(text="human correction", source=source, message_type=MessageType.TEXT, message_id="300")
+    key = build_session_key(source)
+    agent = MagicMock()
+    agent.steer.return_value = True
+    runner._running_agents[key] = agent
+    assert await runner._handle_active_session_busy_message(event, key)
+    agent.steer.assert_called_once_with(event.text)
+    if policy in {"master_disabled", "steer_disabled"}:
+        assert not adapter.sent
+        return
+    assert len(adapter.sent) == 1
+    sent = adapter.sent[0]
+    assert "Steered" in sent["content"]
+    assert sent["metadata"]["thread_id"] == "200"
+    if platform == Platform.DISCORD:
+        assert sent["reply_to"] == "300"
+        assert sent["metadata"]["non_conversational"] is True
+        assert sent["metadata"]["nonconversational_kind"] == "busy_ack"
+    else:
+        assert "non_conversational" not in sent["metadata"]
+        assert "nonconversational_kind" not in sent["metadata"]
+    if policy == "cooldown":
+        assert await runner._handle_active_session_busy_message(event, key)
+        assert agent.steer.call_count == 2  # Input still processed, ACK not repeated.
+        assert len(adapter.sent) == 1

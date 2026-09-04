@@ -74,6 +74,8 @@ def test_yaml_config_seeds_websocket_health_with_primary_precedence(monkeypatch)
     assert os.environ["HERMES_DISCORD_LIVENESS_INTERVAL_SECONDS"] == "11"
     assert os.environ["HERMES_DISCORD_LIVENESS_FAILURE_THRESHOLD"] == "2"
     assert seeded == {
+        "nonconversational_sender_ids": [],
+        "nonconversational_wire_channels": [],
         "websocket_liveness_interval_seconds": 11,
         "websocket_liveness_failure_threshold": 2,
         "websocket_heartbeat_ack_max_age_seconds": 75,
