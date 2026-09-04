@@ -100,6 +100,57 @@ discord:
 
 The old `liveness_interval_seconds` and `liveness_failure_threshold` names remain compatibility aliases only; they no longer mean REST probing.
 
+### Trusted escalation navigation envelopes
+
+Receiver support can be installed **before** any escalation producer. This change
+adds no sending command, thread creation mode, membership operation, or producer
+activation. Ordinary `create_thread` and `hermes send` behavior is unchanged.
+
+In each receiving profile's `config.yaml`, configure only verified sender bot IDs:
+
+```yaml
+discord:
+  escalation_anchor_sender_ids: []
+```
+
+The default empty list suppresses nothing. IDs must be positive decimal strings;
+YAML integers are also accepted and normalized, including duplicate/leading-zero
+IDs. Scalars, booleans, nulls, objects, negative/zero IDs and other invalid elements
+produce a warning and disable the **whole** trust list. This is an immutable,
+adapter-local policy, not an environment variable. Top-level
+`discord.escalation_anchor_sender_ids` wins over
+`platforms.discord.extra.escalation_anchor_sender_ids`, including explicit `[]`.
+An absent policy seeds `[]`; loading another profile cannot inherit trust.
+
+The stdlib-only `discord_escalation_protocol` module exposes
+`build_escalation_anchor(summary, severity="warning")` and
+`is_trusted_escalation_anchor(message, trusted_sender_ids)`. The constructor returns
+empty content, one embed with a `🟡 ` (warning) or `🔴 ` (critical) title and the exact
+URL `https://hermes-agent.nousresearch.com/escalation-anchor/v1`, plus
+`allowed_mentions: {parse: []}`. That URL is an inert discriminator, **never fetched**.
+Summaries must be nonblank and contain no CR/LF or mention tokens (`<@`, `@everyone`,
+`@here`); the final title must fit 200 characters. Invalid input is rejected, not
+truncated.
+
+Only an exact envelope from a trusted, Discord-authenticated bot is inert: ordinary
+message type, no webhook identity, empty/None content, no attachments, stickers,
+components or mentions, and exactly one embed. No additional embed content is
+accepted (including description, footer, fields or images); Discord's `type: rich`
+and server-added non-content `flags` are allowed. Human copies, untrusted bots,
+webhooks, malformed markers and messages with extra content retain the existing
+permission and conversational handling—they are not silently dropped or granted
+access by this policy.
+
+Trusted envelopes are ignored before live/recovery dispatch and claim creation.
+They neither start a parent conversation/auto-thread nor become a hidden
+self-message history boundary, including primary and reply context windows.
+Normal human messages, ordinary reports, directed thread replies and genuine
+self-authored conversational boundaries retain their existing behavior.
+
+Deploy and verify receiver support and trust policy on **every intended receiver
+before enabling a future producer**. Thread membership alone does not grant receipt:
+existing channel allowlists, mention rules and session isolation still apply.
+
 ## Step 1: Create a Discord Application
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and sign in with your Discord account.

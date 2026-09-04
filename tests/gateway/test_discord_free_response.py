@@ -827,3 +827,140 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     )
 
 
+def make_navigation_anchor(channel, author, msg_id=120):
+    message = make_message(channel=channel, content="")
+    message.id = msg_id
+    message.author = author
+    if not hasattr(author, "display_name"):
+        author.display_name = "Anchor bot"
+    channel.guild.id = 1
+    message.type = 0
+    message.embeds = [{"title": "🟡 Needs a decision", "url": "https://hermes-agent.nousresearch.com/escalation-anchor/v1"}]
+    message.webhook_id = None
+    message.guild = channel.guild
+    return message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("require_mention", ["false", "true"])
+async def test_navigation_anchor_never_dispatches_parent_or_creates_thread(adapter, monkeypatch, require_mention):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", require_mention)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter._escalation_anchor_sender_ids = frozenset({"42"})
+    adapter._ready_event.set()
+    channel = FakeTextChannel(channel_id=777)
+    thread = FakeThread(channel_id=778, parent=channel)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    anchor = make_navigation_anchor(channel, SimpleNamespace(id=42, bot=True))
+    # Use the SDK's default enum rather than the mock module's opaque enum.
+    anchor.type = discord_platform.discord.MessageType.default
+    if not isinstance(getattr(anchor.type, "value", None), int):
+        monkeypatch.setattr(discord_platform.discord, "MessageType", SimpleNamespace(default=0, reply=19))
+        anchor.type = 0
+    await adapter._dispatch_discord_message(anchor)
+    adapter.handle_message.assert_not_awaited()
+    adapter._auto_create_thread.assert_not_awaited()
+    assert not adapter._dedup.contains(str(anchor.id))
+    assert not adapter._last_self_message_id
+    # A real in-thread directed follow-up still enters the ordinary handler.
+    adapter._client.user.bot = True
+    normal = make_message(channel=thread, content="<@999> please review", mentions=[adapter._client.user])
+    normal.author.bot = True
+    normal.guild = thread.guild
+    await adapter._dispatch_discord_message(normal)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "778"
+    assert event.source.chat_type == "thread"
+    adapter._auto_create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["human", "bot", "ordinary_embed", "untrusted_anchor", "extra_text"])
+async def test_navigation_filter_preserves_ordinary_ingress(adapter, monkeypatch, kind):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter._escalation_anchor_sender_ids = frozenset({"42"})
+    adapter._ready_event.set()
+    message = make_navigation_anchor(FakeTextChannel(channel_id=777), SimpleNamespace(id=42, bot=True))
+    message.type = discord_platform.discord.MessageType.default
+    if kind == "human":
+        message.author.bot = False
+        message.content = "ordinary human"
+    elif kind == "bot":
+        message.content = "ordinary bot"
+        message.embeds = []
+    elif kind == "ordinary_embed":
+        message.embeds = [{"title": "ordinary embed"}]
+    elif kind == "untrusted_anchor":
+        message.author.id = 43
+    else:
+        message.content = "additional instructions are NOT inert"
+    await adapter._dispatch_discord_message(message)
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].source.chat_id == "777"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own", [True, False])
+@pytest.mark.parametrize("warm", [True, False])
+async def test_navigation_anchor_is_not_a_history_boundary(adapter, monkeypatch, own, warm):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter._escalation_anchor_sender_ids = frozenset({"42", "999"})
+    adapter._client.user.bot = True
+    adapter._ready_event.set()
+    author = adapter._client.user if own else SimpleNamespace(id=42, bot=True)
+    channel = FakeHistoryChannel([], channel_id=777)
+    anchor = make_navigation_anchor(channel, author)
+    alice = SimpleNamespace(id=10, bot=False, display_name="Alice")
+    a = make_history_message(author=alice, content="human A survives", msg_id=110)
+    boundary = make_history_message(author=adapter._client.user, content="genuine response", msg_id=100)
+    old = make_history_message(author=alice, content="already consumed", msg_id=90)
+    channel._history_messages = [old, boundary, a, anchor]
+    if warm:
+        # Exercise the real outbound cache writer, then actual inbound event.
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=100))
+        adapter._client.get_channel = lambda _: channel
+        result = await adapter.send("777", "genuine response")
+        assert result.success
+        assert adapter._last_self_message_id == {"777": "100"}
+        await adapter._dispatch_discord_message(anchor)
+        assert adapter._last_self_message_id == {"777": "100"}
+    trigger = make_message(channel=channel, content="trigger B")
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+    assert "human A survives" in result
+    assert "already consumed" not in result
+    assert "genuine response" not in result
+    assert "Needs a decision" not in result
+
+
+@pytest.mark.asyncio
+async def test_navigation_anchor_reply_window_and_target_stay_inert(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+    adapter._escalation_anchor_sender_ids = frozenset({"999", "42"})
+    adapter._client.user.bot = True
+    adapter._ready_event.set()
+    channel = FakeHistoryChannel([], channel_id=777)
+    anchor = make_navigation_anchor(channel, adapter._client.user, msg_id=100)
+    peer = make_navigation_anchor(channel, SimpleNamespace(id=42, bot=True), msg_id=95)
+    alice = SimpleNamespace(id=10, bot=False, display_name="Alice")
+    a = make_history_message(author=alice, content="older human context", msg_id=90)
+    boundary = make_history_message(author=adapter._client.user, content="ordinary response", msg_id=110)
+    channel._history_messages = [a, peer, anchor, boundary]
+    trigger = make_message(channel=channel, content="<@999> explain this", mentions=[adapter._client.user])
+    trigger.guild = channel.guild
+    trigger.author.bot = False
+    trigger.reference = SimpleNamespace(message_id=100, resolved=anchor)
+    await adapter._dispatch_discord_message(trigger)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert "older human context" in event.channel_context
+    assert "Needs a decision" not in event.channel_context
+    assert "Needs a decision" not in event.text
+    assert not event.reply_to_text

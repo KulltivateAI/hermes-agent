@@ -33,6 +33,7 @@ from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
 from agent.display import ToolPreview
+from discord_escalation_protocol import is_trusted_escalation_anchor
 
 logger = logging.getLogger(__name__)
 
@@ -1024,6 +1025,26 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _normalize_escalation_anchor_sender_ids(value) -> frozenset[str]:
+    """Invalid receiver policy disables suppression rather than broadening trust."""
+    if isinstance(value, list):
+        normalized = set()
+        for item in value:
+            if type(item) not in (str, int):
+                break
+            text = str(item)
+            if not text.isascii() or not text.isdecimal() or not text.lstrip("0"):
+                break
+            normalized.add(text.lstrip("0"))
+        else:
+            return frozenset(normalized)
+    logger.warning(
+        "Invalid discord.escalation_anchor_sender_ids: expected a list of positive "
+        "decimal IDs; disabling escalation anchor filtering for this adapter"
+    )
+    return frozenset()
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -1062,6 +1083,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
+        self._escalation_anchor_sender_ids = _normalize_escalation_anchor_sender_ids(
+            config.extra.get("escalation_anchor_sender_ids", [])
+        )
         self._client: Optional[commands.Bot] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
@@ -1548,6 +1572,8 @@ class DiscordAdapter(BasePlatformAdapter):
         claim: bool,
     ) -> tuple[bool, bool]:
         """Return ``(admitted, role_authorized)`` for one Discord event."""
+        if is_trusted_escalation_anchor(message, self._escalation_anchor_sender_ids):
+            return False, False
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
@@ -2832,7 +2858,9 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return True when a recent Discord message still needs Hermes work."""
         if not self._client or not getattr(self._client, "user", None):
             return False
-        if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
+        # Reject inert envelopes before recovery creates a queued/active claim.
+        admitted, _ = self._discord_message_admission(message, claim=False)
+        if not admitted:
             return False
         if self._discord_message_is_persistently_complete(str(getattr(message, "id", ""))):
             return False
@@ -6901,6 +6929,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 callers decide where to stop.
                 """
                 nonlocal has_unverified
+                if is_trusted_escalation_anchor(msg, self._escalation_anchor_sender_ids):
+                    return None
                 if msg.type not in {discord.MessageType.default, discord.MessageType.reply}:
                     return None
                 content = getattr(msg, "clean_content", msg.content) or ""
@@ -6964,6 +6994,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 after=_after_obj,
                 oldest_first=False,
             ):
+                # An own-authored navigation anchor is not a conversational turn.
+                if is_trusted_escalation_anchor(msg, self._escalation_anchor_sender_ids):
+                    continue
                 # Non-conversational lifecycle/status bumps (self-improvement
                 # reviews, background-process notices, restart banners) must be
                 # skipped BEFORE the partition check — otherwise a delayed
@@ -10316,7 +10349,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
-    seeded_extra = {}
+    seeded_extra = {
+        # Receiver policy is always profile-local; explicit [] overrides nested trust.
+        "escalation_anchor_sender_ids": (
+            discord_cfg["escalation_anchor_sender_ids"]
+            if "escalation_anchor_sender_ids" in discord_cfg
+            else platform_extra_cfg.get("escalation_anchor_sender_ids", [])
+        ),
+    }
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only
