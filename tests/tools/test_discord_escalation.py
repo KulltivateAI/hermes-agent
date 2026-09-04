@@ -791,4 +791,3 @@ def test_storage_failure_before_claim_or_after_ack(tmp_path, remote, monkeypatch
         before = len(remote.calls)
         assert call(tmp_path, retry=True)["status"] == "reconciliation_required"
         assert not any(c[0] in ("POST", "PUT") for c in remote.calls[before:])
-

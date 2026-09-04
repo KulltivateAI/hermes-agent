@@ -21,6 +21,8 @@ from discord_escalation_protocol import (
 
 logger = logging.getLogger(__name__)
 DB_NAME = "discord_escalation_receipts.db"
+STAGES = {f"{phase}_{state}" for phase in ("anchor", "thread", "body")
+          for state in ("pending", "inflight", "rejected", "ambiguous")} | {"members_pending", "complete"}
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS escalation_receipts (
  parent_channel_id TEXT NOT NULL, issue_key TEXT NOT NULL,
@@ -179,12 +181,13 @@ class _Attempt:
         self.sender = self.guild = self.body_hash = None
         self.required, self.verified, self.known = [], [], {}
         self.persisted = True
+        self.receipt_valid = True
         self.post_unrecorded = False
         self.http_status = None
 
     def result(self, status, failure=None):
         row = self.row or {}
-        complete = row.get("stage") == "complete" and row.get("mode") == "create"
+        complete = self.receipt_valid and row.get("stage") == "complete" and row.get("mode") == "create"
         obligations = json.loads(row["required_members_json"]) if row else self.required
         result = dict(
             success=status in ("delivered", "reused", "thread_ready"), status=status,
@@ -375,6 +378,93 @@ class _Attempt:
         if self.row.get("last_error_code") == "membership_failed":
             self.advance(last_error_code=None)
 
+    def validate_row(self):
+        self.receipt_valid = False
+        try:
+            required_columns = {"parent_channel_id", "issue_key", "mode", "sender_id", "guild_id",
+                "input_json", "body_sha256", "required_members_json", "anchor_message_id", "thread_id",
+                "body_message_id", "stage", "revision", "last_error_code", "last_http_status",
+                "retry_not_before", "created_at", "updated_at"}
+            if not required_columns <= self.row.keys():
+                raise ValueError("incomplete receipt schema")
+            row = self.row
+            if row["mode"] not in ("create", "adopt") or row["stage"] not in STAGES:
+                raise ValueError("invalid receipt mode/stage")
+            for key in ("parent_channel_id", "sender_id", "guild_id", "anchor_message_id", "thread_id", "body_message_id"):
+                value = row[key]
+                if value is None and key in ("anchor_message_id", "thread_id", "body_message_id"):
+                    continue
+                if snowflake(value) != value:
+                    raise ValueError("noncanonical receipt ID")
+            if type(row["revision"]) is not int or row["revision"] < 0:
+                raise ValueError("invalid receipt revision")
+            for key in ("created_at", "updated_at", "retry_not_before"):
+                value = row[key]
+                if key == "retry_not_before" and value is None:
+                    continue
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid receipt timestamp")
+            if row["last_http_status"] is not None and (type(row["last_http_status"]) is not int or not 100 <= row["last_http_status"] <= 599):
+                raise ValueError("invalid stored HTTP status")
+            if row["last_error_code"] not in (None, "remote_rejected", "ambiguous_post", "membership_failed"):
+                raise ValueError("invalid stored error disposition")
+            if row["mode"] == "adopt":
+                if (row["stage"] not in ("members_pending", "complete") or row["thread_id"] is None
+                        or any(row[k] is not None for k in ("anchor_message_id", "body_message_id", "body_sha256"))):
+                    raise ValueError("invalid adoption evidence")
+            else:
+                if not isinstance(row["body_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", row["body_sha256"]):
+                    raise ValueError("invalid stored body hash")
+                if not row["stage"].startswith("anchor_") and row["anchor_message_id"] is None:
+                    raise ValueError("stage requires an anchor")
+                if (row["stage"].startswith("body_") or row["stage"] in ("members_pending", "complete")) and row["thread_id"] is None:
+                    raise ValueError("stage requires a thread")
+                if row["thread_id"] is not None and row["thread_id"] != row["anchor_message_id"]:
+                    raise ValueError("thread must equal anchor")
+                if row["stage"] == "complete" and row["body_message_id"] is None:
+                    raise ValueError("complete requires delivery evidence")
+            stored = json.loads(row["input_json"])
+            members = json.loads(self.row["required_members_json"])
+            if not isinstance(stored, dict) or not isinstance(members, list) or not members:
+                raise ValueError("malformed receipt")
+            mode_fields = ({"name", "summary", "severity", "archive_duration", "body_sha256"}
+                           if self.row["mode"] == "create" else {"existing_thread_id"})
+            if set(stored) != {"mode", "parent", "guild", "sender", "recipient", "requester"} | mode_fields:
+                raise ValueError("malformed immutable receipt input")
+            for input_key, column in (("mode", "mode"), ("parent", "parent_channel_id"),
+                                      ("guild", "guild_id"), ("sender", "sender_id")):
+                if stored[input_key] != self.row[column]:
+                    raise ValueError("receipt identity columns disagree")
+            promised = {snowflake(stored[k]) for k in ("sender", "recipient")}
+            if stored["requester"] is not None:
+                promised.add(snowflake(stored["requester"]))
+            if not promised <= set(members):
+                raise ValueError("receipt lost immutable member obligations")
+            if self.row["mode"] == "create" and stored["body_sha256"] != self.row["body_sha256"]:
+                raise ValueError("receipt body hash columns disagree")
+            if members != sorted({snowflake(v) for v in members}) or len(members) > 16:
+                raise ValueError("malformed member obligations")
+        except (ValueError, TypeError, KeyError) as exc:
+            # Keep only independently valid context for exception-safe diagnostics.
+            # Never feed corrupt timestamps, JSON or delivery IDs to result().
+            raw = self.row
+            self.row = {"mode": self.mode, "stage": raw.get("stage") if raw.get("stage") in STAGES else None,
+                        "retry_not_before": None, "required_members_json": "[]", "body_sha256": None}
+            for key in ("sender_id", "guild_id", "anchor_message_id", "thread_id", "body_message_id"):
+                try:
+                    self.row[key] = snowflake(raw.get(key))
+                except ValueError:
+                    self.row[key] = None
+            try:
+                members = json.loads(raw.get("required_members_json", "null"))
+                if isinstance(members, list) and 0 < len(members) <= 16:
+                    self.row["required_members_json"] = canonical_json(sorted({snowflake(v) for v in members}))
+            except (ValueError, TypeError):
+                pass
+            raise sqlite3.DatabaseError("malformed receipt data") from exc
+        self.receipt_valid = True
+        return members
+
     def run(self, policy, name, recipient, issue, summary, severity, body, requester, existing, archive, retry, reconcile):
         try:
             self.parent = snowflake(self.parent)
@@ -408,6 +498,11 @@ class _Attempt:
             observers = observer_ids(policy)
         except (ValueError, TypeError) as exc:
             raise Failure("invalid_input", str(exc)) from exc
+        if (Path(self.home) / DB_NAME).exists():
+            self.conn = open_receipt_db(self.home)
+            self.row = load_receipt(self.conn, self.parent, issue)
+            if self.row is not None:
+                self.validate_row()
         user = self.remote("GET", "/users/@me")
         if not isinstance(user, dict) or user.get("bot") is not True:
             raise Failure("invalid_input", "Authenticated token must identify a bot")
@@ -430,10 +525,11 @@ class _Attempt:
             inputs["existing_thread_id"] = existing
         encoded = canonical_json(inputs)
         thread_obj = None
-        if existing is not None:
+        if existing is not None and self.row is None:
+            # Only first adoption validates activity without receipt context.
             thread_obj = self.thread(self.remote("GET", f"/channels/{existing}"), existing, active=True)
-        self.conn = open_receipt_db(self.home)
-        self.row = load_receipt(self.conn, self.parent, issue)
+        if self.conn is None:
+            self.conn = open_receipt_db(self.home)
         if self.row is None:
             if reconcile is not None:
                 raise Failure("receipt_missing", "Reconciliation requires an existing receipt")
@@ -444,38 +540,7 @@ class _Attempt:
                 required_members_json=canonical_json(self.required), thread_id=existing,
                 stage="members_pending" if existing else "anchor_pending", created_at=now, updated_at=now,
             ))
-        try:
-            required_columns = {"parent_channel_id", "issue_key", "mode", "sender_id", "guild_id",
-                "input_json", "body_sha256", "required_members_json", "anchor_message_id", "thread_id",
-                "body_message_id", "stage", "revision", "last_error_code", "last_http_status",
-                "retry_not_before", "created_at", "updated_at"}
-            if not required_columns <= self.row.keys():
-                raise ValueError("incomplete receipt schema")
-            stored = json.loads(self.row["input_json"])
-            members = json.loads(self.row["required_members_json"])
-            if not isinstance(stored, dict) or not isinstance(members, list) or not members:
-                raise ValueError("malformed receipt")
-            mode_fields = ({"name", "summary", "severity", "archive_duration", "body_sha256"}
-                           if self.row["mode"] == "create" else {"existing_thread_id"})
-            if set(stored) != {"mode", "parent", "guild", "sender", "recipient", "requester"} | mode_fields:
-                raise ValueError("malformed immutable receipt input")
-            for input_key, column in (("mode", "mode"), ("parent", "parent_channel_id"),
-                                      ("guild", "guild_id"), ("sender", "sender_id")):
-                if stored[input_key] != self.row[column]:
-                    raise ValueError("receipt identity columns disagree")
-            promised = {snowflake(stored[k]) for k in ("sender", "recipient")}
-            if stored["requester"] is not None:
-                promised.add(snowflake(stored["requester"]))
-            if not promised <= set(members):
-                raise ValueError("receipt lost immutable member obligations")
-            if self.row["mode"] == "create" and stored["body_sha256"] != self.row["body_sha256"]:
-                raise ValueError("receipt body hash columns disagree")
-            if members != sorted({snowflake(v) for v in members}) or len(members) > 16:
-                raise ValueError("malformed member obligations")
-        except (ValueError, TypeError) as exc:
-            # Do not let a corrupt array re-enter the result serializer.
-            self.row = None
-            raise sqlite3.DatabaseError("malformed receipt input/obligations") from exc
+        members = self.validate_row()
         if self.row["sender_id"] != self.sender:
             raise Failure("identity_conflict", "This issue belongs to another authenticated sender", status="conflict")
         if self.row["input_json"] != encoded:
@@ -492,11 +557,11 @@ class _Attempt:
         if stage.endswith("_rejected") or self.row["last_error_code"] == "membership_failed":
             if not retry:
                 raise Failure("retry_required", "Correct the failure then explicitly retry identical input", "retry", retryable=True)
-            if stage.endswith("_rejected"):
-                self.transition(stage.removesuffix("_rejected") + "_pending")
         self.required = sorted(set(members) | set(self.required))
         if len(self.required) > 16:
             raise Failure("invalid_policy", "New policy exceeds retained 16-member obligations", "correct_config")
+        if stage.endswith("_rejected"):
+            self.transition(stage.removesuffix("_rejected") + "_pending")
         if self.required != members:
             self.advance(required_members_json=canonical_json(self.required))
         if self.row["stage"] == "anchor_pending":
@@ -515,6 +580,8 @@ class _Attempt:
                 thread_obj = None
         self.memberships(thread_obj)
         if self.row["stage"] == "complete":
+            # Linearize readiness against the exact obligations just verified.
+            self.advance(last_error_code=None)
             return self.result("reused" if self.mode == "create" else "thread_ready")
         if self.mode == "adopt":
             self.transition("complete")
@@ -540,11 +607,18 @@ def create_agent_thread(*, token: str, request: Callable, home: Path, policy: di
         return attempt.run(policy, name, for_agent, issue_key, summary, severity, body, requester_id,
                            existing_thread_id, auto_archive_duration, retry, reconcile)
     except ConcurrentUpdate:
-        attempt.row = load_receipt(attempt.conn, attempt.parent, attempt.issue)
-        attempt.known = {}
-        uncertain = attempt.row and attempt.row["stage"].endswith(("_inflight", "_ambiguous"))
-        failure = Failure("concurrent_update", "Another invocation advanced this receipt; no action was reclaimed",
-                          "reconcile" if uncertain else "resume", "reconciliation_required" if uncertain else "pending")
+        try:
+            attempt.row = load_receipt(attempt.conn, attempt.parent, attempt.issue)
+            if attempt.row is not None:
+                attempt.validate_row()
+        except (sqlite3.Error, OSError):
+            attempt.persisted = False
+            failure = Failure("storage_failed", "Receipt reload failed; repair storage before resuming", "repair_storage")
+        else:
+            attempt.known = {}
+            uncertain = attempt.row and attempt.row["stage"].endswith(("_inflight", "_ambiguous"))
+            failure = Failure("concurrent_update", "Another invocation advanced this receipt; no action was reclaimed",
+                              "reconcile" if uncertain else "resume", "reconciliation_required" if uncertain else "pending")
     except (sqlite3.Error, OSError) as exc:
         attempt.persisted = False
         failure = Failure("storage_failed", "Receipt storage failed; repair storage and inspect exact known IDs",
