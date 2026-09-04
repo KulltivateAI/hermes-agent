@@ -2488,6 +2488,9 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Exact wire envelopes must not be rewritten/truncated as plain text on failure.
+    # Network retries still resend the original payload; other adapters default on.
+    allow_formatting_fallback: bool = True
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -5469,6 +5472,7 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        allow_formatting_fallback = result.allow_formatting_fallback
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -5502,6 +5506,7 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                allow_formatting_fallback = allow_formatting_fallback and result.allow_formatting_fallback
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -5519,6 +5524,11 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+
+        # A previous transport veto cannot be undone by a later default result.
+        if not allow_formatting_fallback:
+            logger.warning("[%s] Send failed: %s — formatting fallback vetoed", self.name, error_str)
+            return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)

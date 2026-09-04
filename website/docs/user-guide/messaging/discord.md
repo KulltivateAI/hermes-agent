@@ -100,56 +100,86 @@ discord:
 
 The old `liveness_interval_seconds` and `liveness_failure_threshold` names remain compatibility aliases only; they no longer mean REST probing.
 
-### Trusted escalation navigation envelopes
+### Trusted nonconversational envelopes
 
-Receiver support can be installed **before** any escalation producer. This change
-adds no sending command, thread creation mode, membership operation, or producer
-activation. Ordinary `create_thread` and `hermes send` behavior is unchanged.
+Hermes can keep navigation anchors and gateway busy acknowledgments visible without
+starting a peer agent turn. Genuine human steering and bot handoffs still process
+normally. This adds no escalation sender command, automatic membership, or receipt
+store; ordinary `create_thread` and `hermes send` behavior is unchanged.
 
-In each receiving profile's `config.yaml`, configure only verified sender bot IDs:
+Each profile has two independent settings (both default empty):
 
 ```yaml
 discord:
-  escalation_anchor_sender_ids: []
+  nonconversational_sender_ids: []
+  nonconversational_wire_channels: []
 ```
 
-The default empty list suppresses nothing. IDs must be positive decimal strings;
-YAML integers are also accepted and normalized, including duplicate/leading-zero
-IDs. Scalars, booleans, nulls, objects, negative/zero IDs and other invalid elements
-produce a warning and disable the **whole** trust list. This is an immutable,
-adapter-local policy, not an environment variable. Top-level
-`discord.escalation_anchor_sender_ids` wins over
-`platforms.discord.extra.escalation_anchor_sender_ids`, including explicit `[]`.
-An absent policy seeds `[]`; loading another profile cannot inherit trust.
+`nonconversational_sender_ids` is the trusted set of authenticated sender bot IDs,
+including the receiving bot itself so its own ACK is not mistaken for a substantive
+response during recovery. `nonconversational_wire_channels` enables busy-envelope
+sending only for the **exact resolved destination**; `metadata.thread_id` takes
+precedence over the channel ID. Enabling a parent does not enable its threads.
+Only explicitly typed `nonconversational_kind: busy_ack` sends are wrapped. Other
+locally marked notices, ordinary replies, and inactive destinations are unchanged.
 
-The stdlib-only `discord_escalation_protocol` module exposes
-`build_escalation_anchor(summary, severity="warning")` and
-`is_trusted_escalation_anchor(message, trusted_sender_ids)`. The constructor returns
-empty content, one embed with a `🟡 ` (warning) or `🔴 ` (critical) title and the exact
-URL `https://hermes-agent.nousresearch.com/escalation-anchor/v1`, plus
-`allowed_mentions: {parse: []}`. That URL is an inert discriminator, **never fetched**.
-Summaries must be nonblank and contain no CR/LF or mention tokens (`<@`, `@everyone`,
-`@here`); the final title must fit 200 characters. Invalid input is rejected, not
-truncated.
+Both lists accept positive decimal strings or YAML integers, normalizing leading
+zeros and duplicates. Any invalid member or non-list value (including null or a
+boolean) warns and disables that entire policy. Immutable adapter-local snapshots
+are loaded through the plugin YAML bridge, never the environment. Top-level
+`discord.<key>` wins over `platforms.discord.extra.<key>`, including explicit `[]`;
+absence seeds `[]`, not another profile's policy.
 
-Only an exact envelope from a trusted, Discord-authenticated bot is inert: ordinary
-message type, no webhook identity, empty/None content, no attachments, stickers,
-components or mentions, and exactly one embed. No additional embed content is
-accepted (including description, footer, fields or images); Discord's `type: rich`
-and server-added non-content `flags` are allowed. Human copies, untrusted bots,
-webhooks, malformed markers and messages with extra content retain the existing
-permission and conversational handling—they are not silently dropped or granted
-access by this policy.
+The stdlib-only `discord_escalation_protocol` module exposes:
 
-Trusted envelopes are ignored before live/recovery dispatch and claim creation.
-They neither start a parent conversation/auto-thread nor become a hidden
-self-message history boundary, including primary and reply context windows.
-Normal human messages, ordinary reports, directed thread replies and genuine
-self-authored conversational boundaries retain their existing behavior.
+- `build_escalation_anchor(summary, severity="warning")`: empty content, one embed
+  with `🟡 ` or `🔴 ` title and URL
+  `https://hermes-agent.nousresearch.com/escalation-anchor/v1`, plus
+  `allowed_mentions: {parse: []}`. Nonblank, single-line summaries must fit a
+  200-character final title and exclude `<@`, `@everyone`, and `@here`.
+- `build_busy_notice(text)`: empty content, one embed with description exactly equal
+  to the nonblank text (at most 2000 characters), and URL
+  `https://hermes-agent.nousresearch.com/busy-notice/v1`. Existing formatting and
+  splitting happen before wrapping each chunk; the constructor never truncates.
+- `is_trusted_nonconversational_message(message, trusted_sender_ids)`: one shared,
+  total predicate for native SDK objects and dictionary messages. The URLs are
+  **inert discriminators, never fetched**.
 
-Deploy and verify receiver support and trust policy on **every intended receiver
-before enabling a future producer**. Thread membership alone does not grant receipt:
-existing channel allowlists, mention rules and session isolation still apply.
+Recognition requires `author.bot` exactly true and a trusted ID, no webhook,
+empty/None content, exactly one matching embed, and no attachments, stickers or
+components. No extra content-bearing embed keys are allowed; Discord's `type:
+rich` and server-added `flags` are accepted. Anchors require DEFAULT type and no
+mentions. Busy notices allow DEFAULT or REPLY, retaining Discord-generated reply
+mentions/reference metadata. Human copies, untrusted bots, unknown/malformed
+markers and extra content retain normal authorization and conversational handling;
+plain `⚡...` text is not protocol-classified by prefix.
+
+Trusted envelopes are ignored before live/recovery claims, scheduling, or session
+append. They neither create an auto-thread nor form a hidden self-message history
+boundary (warm/cold, primary/reply windows). An own trusted busy reply does not
+prove the original request was answered; genuine substantive replies still do.
+Human acknowledgments remain visible and reply-linked. Busy text/mode, cooldown,
+master/steer ACK switches and other platforms are unchanged.
+
+Busy send-new transport preserves reply mode (first/all/off), allowed-mentions
+policy and the exact envelope on invalid-reference retries. All chunk IDs are
+locally nonconversational. Typed, activated sends return a failure for unsupported
+targets or transport failures; they never create a forum post or downgrade to
+plain text. Their `SendResult.allow_formatting_fallback` veto persists across the
+inherited retry call, while existing bounded network retries resend full original
+text/metadata. Exhausted-network diagnostics retain the envelope and the original
+call still returns failure. No protocol edit/media transport is supported here.
+
+**Receiver-first activation:** install reviewed receiver code and trusted IDs on
+all intended listeners first, keeping wire destinations empty. Verify the exact
+destination is a guild text/news channel or public thread and the bot has Embed
+Links permission before opting it in. Private threads, DMs and forum parents are
+not supported activated targets and fail before sending. Then enable only the
+verified destination and test real handoffs, visible human ACKs and absence of
+notice-triggered turns. Membership does not bypass channel/session admission.
+If canary validation fails, disable wire emission and restore the prior narrow
+intake policy; preserve session/history evidence. Fleet rollout and any future
+escalation-anchor producer are separate changes, not enabled by installing C1.
 
 ## Step 1: Create a Discord Application
 

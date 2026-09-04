@@ -827,7 +827,7 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     )
 
 
-def make_navigation_anchor(channel, author, msg_id=120):
+def make_navigation_anchor(channel, author, msg_id=120, kind="anchor"):
     message = make_message(channel=channel, content="")
     message.id = msg_id
     message.author = author
@@ -836,6 +836,9 @@ def make_navigation_anchor(channel, author, msg_id=120):
     channel.guild.id = 1
     message.type = 0
     message.embeds = [{"title": "🟡 Needs a decision", "url": "https://hermes-agent.nousresearch.com/escalation-anchor/v1"}]
+    if kind == "busy":
+        message.embeds = [{"description": "Needs a decision", "url": "https://hermes-agent.nousresearch.com/busy-notice/v1"}]
+        message.type = 19
     message.webhook_id = None
     message.guild = channel.guild
     return message
@@ -847,7 +850,7 @@ async def test_navigation_anchor_never_dispatches_parent_or_creates_thread(adapt
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", require_mention)
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
-    adapter._escalation_anchor_sender_ids = frozenset({"42"})
+    adapter._nonconversational_sender_ids = frozenset({"42"})
     adapter._ready_event.set()
     channel = FakeTextChannel(channel_id=777)
     thread = FakeThread(channel_id=778, parent=channel)
@@ -883,7 +886,7 @@ async def test_navigation_filter_preserves_ordinary_ingress(adapter, monkeypatch
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
-    adapter._escalation_anchor_sender_ids = frozenset({"42"})
+    adapter._nonconversational_sender_ids = frozenset({"42"})
     adapter._ready_event.set()
     message = make_navigation_anchor(FakeTextChannel(channel_id=777), SimpleNamespace(id=42, bot=True))
     message.type = discord_platform.discord.MessageType.default
@@ -907,14 +910,15 @@ async def test_navigation_filter_preserves_ordinary_ingress(adapter, monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("own", [True, False])
 @pytest.mark.parametrize("warm", [True, False])
-async def test_navigation_anchor_is_not_a_history_boundary(adapter, monkeypatch, own, warm):
+@pytest.mark.parametrize("kind", ["anchor", "busy"])
+async def test_navigation_anchor_is_not_a_history_boundary(adapter, monkeypatch, own, warm, kind):
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
-    adapter._escalation_anchor_sender_ids = frozenset({"42", "999"})
+    adapter._nonconversational_sender_ids = frozenset({"42", "999"})
     adapter._client.user.bot = True
     adapter._ready_event.set()
     author = adapter._client.user if own else SimpleNamespace(id=42, bot=True)
     channel = FakeHistoryChannel([], channel_id=777)
-    anchor = make_navigation_anchor(channel, author)
+    anchor = make_navigation_anchor(channel, author, kind=kind)
     alice = SimpleNamespace(id=10, bot=False, display_name="Alice")
     a = make_history_message(author=alice, content="human A survives", msg_id=110)
     boundary = make_history_message(author=adapter._client.user, content="genuine response", msg_id=100)
@@ -938,17 +942,18 @@ async def test_navigation_anchor_is_not_a_history_boundary(adapter, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_navigation_anchor_reply_window_and_target_stay_inert(adapter, monkeypatch):
+@pytest.mark.parametrize("kind", ["anchor", "busy"])
+async def test_navigation_anchor_reply_window_and_target_stay_inert(adapter, monkeypatch, kind):
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
-    adapter._escalation_anchor_sender_ids = frozenset({"999", "42"})
+    adapter._nonconversational_sender_ids = frozenset({"999", "42"})
     adapter._client.user.bot = True
     adapter._ready_event.set()
     channel = FakeHistoryChannel([], channel_id=777)
-    anchor = make_navigation_anchor(channel, adapter._client.user, msg_id=100)
-    peer = make_navigation_anchor(channel, SimpleNamespace(id=42, bot=True), msg_id=95)
+    anchor = make_navigation_anchor(channel, adapter._client.user, msg_id=100, kind=kind)
+    peer = make_navigation_anchor(channel, SimpleNamespace(id=42, bot=True), msg_id=95, kind=kind)
     alice = SimpleNamespace(id=10, bot=False, display_name="Alice")
     a = make_history_message(author=alice, content="older human context", msg_id=90)
     boundary = make_history_message(author=adapter._client.user, content="ordinary response", msg_id=110)
@@ -964,3 +969,140 @@ async def test_navigation_anchor_reply_window_and_target_stay_inert(adapter, mon
     assert "Needs a decision" not in event.channel_context
     assert "Needs a decision" not in event.text
     assert not event.reply_to_text
+
+
+@pytest.fixture
+def busy_wire(adapter, monkeypatch):
+    class WireEmbed:
+        @classmethod
+        def from_dict(cls, payload):
+            obj = cls()
+            obj.payload = dict(payload)
+            return obj
+
+        def to_dict(self):
+            return self.payload
+
+    monkeypatch.setattr(discord_platform.discord, "Embed", WireEmbed)
+    monkeypatch.setattr(discord_platform.discord, "MessageReference", lambda **kwargs: SimpleNamespace(resolved=None, **kwargs))
+    monkeypatch.setattr(discord_platform.discord, "MessageType", SimpleNamespace(default=0, reply=19))
+    channel = FakeTextChannel(channel_id=777)
+    channel.type = SimpleNamespace(value=0)
+    channel.guild.id = 1
+    channel.send = AsyncMock(side_effect=[SimpleNamespace(id=i) for i in range(201, 250)])
+    adapter._client.get_channel = lambda channel_id: channel
+    adapter._nonconversational_wire_channels = frozenset({"777"})
+    adapter._nonconversational_sender_ids = frozenset({"999"})
+    adapter._last_self_message_id = {"777": "100"}
+    adapter._record_discord_response = MagicMock()
+    return channel, {"non_conversational": True, "nonconversational_kind": "busy_ack"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply_mode", ["first", "all", "off"])
+async def test_busy_wire_chunks_and_reference_retry(adapter, busy_wire, reply_mode):
+    channel, metadata = busy_wire
+    adapter._reply_to_mode = reply_mode
+    text = "Visible acknowledgment and onboarding. " * 130
+    expected = adapter.truncate_message(adapter.format_message(text), adapter.MAX_MESSAGE_LENGTH)
+    if reply_mode != "off":
+        channel.send.side_effect = [RuntimeError("error code: 10008"), *[SimpleNamespace(id=i) for i in range(201, 250)]]
+    result = await adapter.send("123", text, reply_to="50", metadata={**metadata, "thread_id": "777"})
+    assert result.success
+    calls = [call.kwargs for call in channel.send.await_args_list]
+    if reply_mode != "off":
+        assert calls[0]["reference"].message_id == 50
+        assert calls[0]["embed"].to_dict() == calls[1]["embed"].to_dict()
+        calls = calls[1:]
+    assert [c["embed"].to_dict()["description"] for c in calls] == expected
+    assert all(c["content"] == "" for c in calls)
+    assert all(c["embed"].to_dict()["url"].endswith("busy-notice/v1") for c in calls)
+    assert all(c["reference"] is None for c in calls)
+    assert adapter._last_self_message_id == {"777": "100"}
+    assert all(i in adapter._nonconversational_messages for i in result.raw_response["message_ids"])
+
+
+@pytest.mark.asyncio
+async def test_busy_wire_partial_delivery_marks_successful_chunks(adapter, busy_wire):
+    channel, metadata = busy_wire
+    channel.send.side_effect = [SimpleNamespace(id=201), RuntimeError("Missing Permissions")]
+    result = await adapter.send("777", "busy " * 500, metadata=metadata)
+    assert not result.success
+    assert result.allow_formatting_fallback is False
+    assert "201" in adapter._nonconversational_messages
+    assert adapter._last_self_message_id == {"777": "100"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["ordinary", "other_notice", "inactive", "thread_override"])
+async def test_busy_wire_legacy_target_and_kind_unchanged(adapter, busy_wire, case):
+    channel, metadata = busy_wire
+    if case == "ordinary":
+        metadata = None
+    elif case == "other_notice":
+        metadata = {"non_conversational": True}
+    elif case == "inactive":
+        adapter._nonconversational_wire_channels = frozenset()
+    else:
+        metadata = {**metadata, "thread_id": "778"}
+    result = await adapter.send("777", "visible ordinary message", metadata=metadata)
+    assert result.success
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["content"] == "visible ordinary message"
+    assert "embed" not in kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disconnected", "empty", "forum", "private_thread", "dm", "missing"])
+async def test_busy_wire_early_failures_veto_fallback(adapter, busy_wire, failure):
+    channel, metadata = busy_wire
+    if failure == "disconnected":
+        adapter._client = None
+    elif failure in {"forum", "private_thread", "dm"}:
+        channel.type = {"forum": 15, "private_thread": 12, "dm": 1}[failure]
+    elif failure == "missing":
+        adapter._client.get_channel = lambda _: None
+        adapter._client.fetch_channel = AsyncMock(return_value=None)
+    result = await adapter.send("777", "" if failure == "empty" else "busy", metadata=metadata)
+    assert not result.success
+    assert result.allow_formatting_fallback is False
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["permanent", "transient_permanent", "transient_success", "exhausted", "timeout", "legacy"])
+async def test_busy_wire_inherited_retry_never_rewrites_ack(adapter, busy_wire, monkeypatch, scenario):
+    channel, metadata = busy_wire
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+    text = "ACK complete content " * 230  # >3500: old formatting fallback silently truncated this.
+    expected = adapter.truncate_message(adapter.format_message(text), adapter.MAX_MESSAGE_LENGTH)
+    errors = {
+        "permanent": [RuntimeError("Missing Permissions")],
+        "transient_permanent": [RuntimeError("ConnectionError"), RuntimeError("Missing Permissions")],
+        "transient_success": [RuntimeError("ConnectionError")],
+        "exhausted": [RuntimeError("ConnectionError")] * 3,
+        "timeout": [RuntimeError("read timed out")],
+        "legacy": [RuntimeError("Missing Permissions")],
+    }[scenario]
+    channel.send.side_effect = [*errors, *[SimpleNamespace(id=i) for i in range(201, 250)]]
+    if scenario == "legacy":
+        metadata = None
+    result = await adapter._send_with_retry("777", text, reply_to="50", metadata=metadata, base_delay=0)
+    calls = [call.kwargs for call in channel.send.await_args_list]
+    if scenario == "legacy":
+        assert result.success
+        assert calls[1]["content"].startswith("(Response formatting failed, plain text:)")
+        return
+    assert all(c["content"] == "" and "embed" in c for c in calls)
+    descriptions = [c["embed"].to_dict()["description"] for c in calls]
+    assert not any("Response formatting failed" in d for d in descriptions)
+    if scenario == "transient_success":
+        assert result.success
+        assert descriptions[1:] == expected
+    else:
+        assert not result.success
+        assert result.allow_formatting_fallback is False
+        assert len(calls) == {"permanent": 1, "transient_permanent": 2, "exhausted": 4, "timeout": 1}[scenario]
+        if scenario == "exhausted":
+            assert "Message delivery failed" in descriptions[-1]
+    assert adapter._last_self_message_id == {"777": "100"}

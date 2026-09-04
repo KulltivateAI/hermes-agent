@@ -1,6 +1,7 @@
-"""Pure, inert Discord escalation navigation envelopes (no SDK or gateway imports)."""
+"""Pure Discord nonconversational envelopes; no SDK, gateway or network imports."""
 
 _ANCHOR_URL = "https://hermes-agent.nousresearch.com/escalation-anchor/v1"
+_BUSY_URL = "https://hermes-agent.nousresearch.com/busy-notice/v1"
 _SEVERITIES = {"warning": "🟡", "critical": "🔴"}
 _MENTION_TOKENS = ("<@", "@everyone", "@here")
 
@@ -16,7 +17,7 @@ def _valid_summary(summary):
 
 
 def build_escalation_anchor(summary: str, severity: str = "warning") -> dict:
-    """Build a navigation-only payload; reject unsafe/oversized titles, never truncate."""
+    """Build navigation-only data; reject unsafe/oversized titles, never truncate."""
     if not isinstance(severity, str) or severity not in _SEVERITIES:
         raise ValueError("severity must be warning or critical")
     if not _valid_summary(summary) or len(summary) + 2 > 200:
@@ -28,15 +29,23 @@ def build_escalation_anchor(summary: str, severity: str = "warning") -> dict:
     }
 
 
+def build_busy_notice(text: str) -> dict:
+    """Wrap one already formatted/split ACK chunk without rewriting its text."""
+    if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+        raise ValueError("busy notice must be nonblank text of at most 2000 characters")
+    return {"content": "", "embeds": [{"description": text, "url": _BUSY_URL}]}
+
+
 def _get(obj, key, default=None):
     return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
-def is_trusted_escalation_anchor(message, trusted_sender_ids) -> bool:
-    """Recognize only an exact envelope from a Discord-authenticated trusted bot.
+def is_trusted_nonconversational_message(message, trusted_sender_ids) -> bool:
+    """Exact envelope + authenticated bot identity, never text-prefix matching.
 
-    Malformed or extra-content messages are not anchors and retain normal admission
-    rules. The URL is a discriminator, never a network destination to fetch.
+    Discriminators are inert URLs. Extra or malformed content retains the normal
+    admission policy. Busy replies may carry Discord-generated mention/reference
+    metadata; anchors must remain mention-free DEFAULT messages.
     """
     try:
         if not trusted_sender_ids:
@@ -55,15 +64,12 @@ def is_trusted_escalation_anchor(message, trusted_sender_ids) -> bool:
             return False
         kind = _get(message, "type")
         kind = getattr(kind, "value", kind)
-        if type(kind) is not int or kind != 0:
+        if type(kind) is not int or kind not in (0, 19):
             return False
         content = _get(message, "content")
         if content is not None and (not isinstance(content, str) or content != ""):
             return False
-        if any(_get(message, key) for key in (
-            "attachments", "stickers", "sticker_items", "components", "mentions",
-            "role_mentions", "mention_roles", "mention_everyone",
-        )):
+        if any(_get(message, key) for key in ("attachments", "stickers", "sticker_items", "components")):
             return False
         embeds = _get(message, "embeds")
         if not isinstance(embeds, (list, tuple)) or len(embeds) != 1:
@@ -71,18 +77,25 @@ def is_trusted_escalation_anchor(message, trusted_sender_ids) -> bool:
         embed = embeds[0]
         if not isinstance(embed, dict):
             embed = embed.to_dict()
-        if not isinstance(embed, dict) or set(embed) - {"title", "url", "type", "flags"}:
+        if not isinstance(embed, dict) or embed.get("type", "rich") != "rich":
             return False
-        if embed.get("url") != _ANCHOR_URL or embed.get("type", "rich") != "rich":
+        if embed.get("url") == _BUSY_URL:
+            text = embed.get("description")
+            return (
+                not (set(embed) - {"description", "url", "type", "flags"})
+                and isinstance(text, str) and bool(text.strip()) and len(text) <= 2000
+            )
+        if kind != 0 or any(_get(message, key) for key in (
+            "mentions", "role_mentions", "mention_roles", "mention_everyone",
+        )):
+            return False
+        if set(embed) - {"title", "url", "type", "flags"} or embed.get("url") != _ANCHOR_URL:
             return False
         title = embed.get("title")
         return (
-            isinstance(title, str)
-            and len(title) <= 200
-            and title[:2] in ("🟡 ", "🔴 ")
-            and _valid_summary(title[2:])
+            isinstance(title, str) and len(title) <= 200
+            and title[:2] in ("🟡 ", "🔴 ") and _valid_summary(title[2:])
         )
     except Exception:
-        # Duck-typed SDK objects/fixtures may expose malformed properties or embeds.
-        # Recognition must never turn malformed input into an admission exception.
+        # SDK properties and malformed embeds must not cause admission exceptions.
         return False

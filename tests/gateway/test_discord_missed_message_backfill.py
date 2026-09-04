@@ -463,7 +463,7 @@ async def test_navigation_anchor_recovery_does_not_dispatch_and_neighbors_run_on
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setattr(discord, "MessageType", SimpleNamespace(default=0, reply=19))
-    adapter._escalation_anchor_sender_ids = frozenset({"42"})
+    adapter._nonconversational_sender_ids = frozenset({"42"})
     anchor = make_bot_message(message_id=102, content="")
     anchor.embeds = [{"title": "🟡 Needs a decision", "url": "https://hermes-agent.nousresearch.com/escalation-anchor/v1"}]
     before = make_message(message_id=101)
@@ -509,3 +509,21 @@ async def test_navigation_anchor_recovery_does_not_dispatch_and_neighbors_run_on
     assert processed == [101, 103]
     assert not adapter._discord_message_is_persistently_complete("102")
     assert not adapter._discord_message_has_active_claim("102")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notice", [True, False])
+async def test_busy_reply_is_not_recovery_completion(adapter, monkeypatch, notice):
+    monkeypatch.setattr(discord, "MessageType", SimpleNamespace(default=0, reply=19))
+    adapter._nonconversational_sender_ids = frozenset({"999"})
+    reply = make_message(message_id=2, author_id=999, content="" if notice else "Done, substantive answer")
+    reply.author.bot = True
+    reply.type = 19
+    reply.reference = SimpleNamespace(message_id=1)
+    reply.mentions = [SimpleNamespace(id=42)]
+    reply.embeds = [{"description": "⚡ Working on it", "url": "https://hermes-agent.nousresearch.com/busy-notice/v1"}] if notice else []
+    channel = FakeChannel(history_messages=[reply])
+    original = make_message(message_id=1, channel=channel)
+    assert not adapter._discord_message_is_persistently_complete("1")
+    assert not adapter._discord_message_has_active_claim("1")
+    assert await adapter._should_backfill_discord_message(original) is notice

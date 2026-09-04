@@ -7,7 +7,8 @@ import pytest
 
 from discord_escalation_protocol import (
     build_escalation_anchor,
-    is_trusted_escalation_anchor,
+    build_busy_notice,
+    is_trusted_nonconversational_message,
 )
 
 
@@ -46,21 +47,21 @@ def test_invalid_severity(severity):
 
 def test_exact_authenticated_envelope_and_sdk_objects():
     message = anchor_message()
-    assert is_trusted_escalation_anchor(message, frozenset({"42"}))
+    assert is_trusted_nonconversational_message(message, frozenset({"42"}))
     message["author"]["id"] = 42
     message["content"] = None
     message["embeds"][0].update(type="rich", flags=0)
-    assert is_trusted_escalation_anchor(message, {"42"})
+    assert is_trusted_nonconversational_message(message, {"42"})
     embed = SimpleNamespace(to_dict=lambda: message["embeds"][0])
     obj = SimpleNamespace(**{**message, "author": SimpleNamespace(**message["author"]), "embeds": [embed], "type": SimpleNamespace(value=0)})
-    assert is_trusted_escalation_anchor(obj, {"42"})
+    assert is_trusted_nonconversational_message(obj, {"42"})
 
 
 @pytest.mark.parametrize("author", [None, {}, {"id": "42", "bot": False}, {"id": "42", "bot": 1}, {"id": "43", "bot": True}, {"id": True, "bot": True}, {"id": [], "bot": True}])
 def test_only_trusted_bot_identity(author):
     message = anchor_message()
     message["author"] = author
-    assert not is_trusted_escalation_anchor(message, {"42"})
+    assert not is_trusted_nonconversational_message(message, {"42"})
 
 
 @pytest.mark.parametrize("key,value", [
@@ -74,7 +75,7 @@ def test_only_trusted_bot_identity(author):
 def test_extra_content_is_not_an_anchor(key, value):
     message = anchor_message()
     message[key] = value
-    assert not is_trusted_escalation_anchor(message, {"42"})
+    assert not is_trusted_nonconversational_message(message, {"42"})
 
 
 @pytest.mark.parametrize("key,value", [
@@ -86,23 +87,23 @@ def test_extra_content_is_not_an_anchor(key, value):
 def test_strict_embed_grammar(key, value):
     message = anchor_message()
     message["embeds"][0][key] = value
-    assert not is_trusted_escalation_anchor(message, {"42"})
+    assert not is_trusted_nonconversational_message(message, {"42"})
 
 
 @pytest.mark.parametrize("message", [None, True, 1, "", [], {}, {"embeds": [object()]}])
 def test_total_on_malformed_shapes(message):
-    assert not is_trusted_escalation_anchor(message, {"42"})
+    assert not is_trusted_nonconversational_message(message, {"42"})
 
 
 def test_no_trust_and_broken_embed_are_not_suppressed():
     message = anchor_message()
-    assert not is_trusted_escalation_anchor(message, set())
-    assert not is_trusted_escalation_anchor(message, None)
+    assert not is_trusted_nonconversational_message(message, set())
+    assert not is_trusted_nonconversational_message(message, None)
     class BrokenEmbed:
         def to_dict(self):
             raise ValueError("malformed")
     message["embeds"] = [BrokenEmbed()]
-    assert not is_trusted_escalation_anchor(message, {"42"})
+    assert not is_trusted_nonconversational_message(message, {"42"})
 
 
 def test_protocol_import_has_no_sdk_or_gateway_dependency():
@@ -134,21 +135,25 @@ def load_adapter(tmp_path, monkeypatch, name, policy):
 
 
 @pytest.mark.parametrize("policy,expected", [
-    ({"discord": {"escalation_anchor_sender_ids": [42, "42", "0043"]}}, {"42", "43"}),
-    ({"platforms": {"discord": {"extra": {"escalation_anchor_sender_ids": [42]}}}}, {"42"}),
-    ({"discord": {"escalation_anchor_sender_ids": []}, "platforms": {"discord": {"extra": {"escalation_anchor_sender_ids": [42]}}}}, set()),
-    ({"discord": {"escalation_anchor_sender_ids": [43]}, "platforms": {"discord": {"extra": {"escalation_anchor_sender_ids": [42]}}}}, {"43"}),
+    ({"discord": {"nonconversational_sender_ids": [42, "42", "0043"]}}, {"42", "43"}),
+    ({"platforms": {"discord": {"extra": {"nonconversational_sender_ids": [42]}}}}, {"42"}),
+    ({"discord": {"nonconversational_sender_ids": []}, "platforms": {"discord": {"extra": {"nonconversational_sender_ids": [42]}}}}, set()),
+    ({"discord": {"nonconversational_sender_ids": [43]}, "platforms": {"discord": {"extra": {"nonconversational_sender_ids": [42]}}}}, {"43"}),
     ({"discord": {}}, set()),
 ])
-def test_real_config_bridge_and_two_profile_isolation(tmp_path, monkeypatch, policy, expected):
-    first = load_adapter(tmp_path, monkeypatch, "one", {"discord": {"escalation_anchor_sender_ids": [42]}})
+@pytest.mark.parametrize("key", ["nonconversational_sender_ids", "nonconversational_wire_channels"])
+def test_real_config_bridge_and_two_profile_isolation(tmp_path, monkeypatch, policy, expected, key):
+    import json
+    policy = json.loads(json.dumps(policy).replace("nonconversational_sender_ids", key))
+    first = load_adapter(tmp_path, monkeypatch, "one", {"discord": {"nonconversational_sender_ids": [42], "nonconversational_wire_channels": [42]}})
     second = load_adapter(tmp_path, monkeypatch, "two", policy)
-    assert first._escalation_anchor_sender_ids == frozenset({"42"})
-    assert second._escalation_anchor_sender_ids == frozenset(expected)
-    assert isinstance(second._escalation_anchor_sender_ids, frozenset)
-    assert "escalation_anchor_sender_ids" in second.config.extra
+    assert first._nonconversational_sender_ids == frozenset({"42"})
+    assert getattr(second, "_" + key) == frozenset(expected)
+    assert isinstance(second._nonconversational_sender_ids, frozenset)
+    assert "nonconversational_sender_ids" in second.config.extra
     # Keep both adapters alive after switching profiles; no env read may change policy.
-    monkeypatch.setenv("DISCORD_ESCALATION_ANCHOR_SENDER_IDS", "43")
+    monkeypatch.setenv("DISCORD_NONCONVERSATIONAL_SENDER_IDS", "43")
+    monkeypatch.setenv("DISCORD_NONCONVERSATIONAL_WIRE_CHANNELS", "43")
     from plugins.platforms.discord.adapter import discord
     # Existing plugin test discovery may supply an opaque MagicMock SDK enum.
     monkeypatch.setattr(discord, "MessageType", SimpleNamespace(default=0, reply=19))
@@ -161,19 +166,52 @@ def test_real_config_bridge_and_two_profile_isolation(tmp_path, monkeypatch, pol
     message.mentions = []
     assert first._discord_message_admission(message, claim=True) == (False, False)
     assert not first._dedup.contains("123")
-    assert second._discord_message_admission(message, claim=False)[0] == ("42" not in expected)
-    assert first._escalation_anchor_sender_ids == frozenset({"42"})
-    assert second._escalation_anchor_sender_ids == frozenset(expected)
+    assert second._discord_message_admission(message, claim=False)[0] == (
+        key != "nonconversational_sender_ids" or "42" not in expected
+    )
+    assert first._nonconversational_sender_ids == frozenset({"42"})
+    assert getattr(second, "_" + key) == frozenset(expected)
 
 
 @pytest.mark.parametrize("invalid", [None, "42", 42, {}, [True], [None], [{}], [-1], [0], ["-2"], ["1.0"], [" 42"], [42, False], ["٤٢"]])
-def test_invalid_policy_warns_and_disables_whole_list(tmp_path, monkeypatch, caplog, invalid):
-    adapter = load_adapter(tmp_path, monkeypatch, "invalid", {"discord": {"escalation_anchor_sender_ids": invalid}})
-    assert adapter._escalation_anchor_sender_ids == frozenset()
-    assert "escalation_anchor_sender_ids" in caplog.text
+@pytest.mark.parametrize("key", ["nonconversational_sender_ids", "nonconversational_wire_channels"])
+def test_invalid_policy_warns_and_disables_whole_list(tmp_path, monkeypatch, caplog, invalid, key):
+    adapter = load_adapter(tmp_path, monkeypatch, "invalid", {"discord": {key: invalid}})
+    assert getattr(adapter, "_" + key) == frozenset()
+    assert key in caplog.text
     assert "WARNING" in caplog.text
 
 
 def test_default_policy_registration():
     from hermes_cli.config import DEFAULT_CONFIG
-    assert DEFAULT_CONFIG["discord"]["escalation_anchor_sender_ids"] == []
+    assert DEFAULT_CONFIG["discord"]["nonconversational_sender_ids"] == []
+    assert DEFAULT_CONFIG["discord"]["nonconversational_wire_channels"] == []
+
+
+@pytest.mark.parametrize("text", ["busy", "⚡ <@42> steering\nOnboarding", "x" * 2000])
+def test_busy_constructor_and_reply_metadata(text):
+    payload = build_busy_notice(text)
+    assert payload == {"content": "", "embeds": [{"description": text, "url": "https://hermes-agent.nousresearch.com/busy-notice/v1"}]}
+    for kind in (0, 19, SimpleNamespace(value=19)):
+        message = {**payload, "author": {"id": 42, "bot": True}, "type": kind, "mentions": [{"id": 12}], "reference": {"message_id": 1}}
+        assert is_trusted_nonconversational_message(message, {"42"})
+        message["embeds"][0]["title"] = "extra"
+        assert not is_trusted_nonconversational_message(message, {"42"})
+        del message["embeds"][0]["title"]
+
+
+@pytest.mark.parametrize("text", ["", " ", None, 1, "x" * 2001])
+def test_invalid_busy_text(text):
+    with pytest.raises(ValueError):
+        build_busy_notice(text)
+
+
+@pytest.mark.parametrize("change", [
+    {"content": "⚡ Interrupting"}, {"type": 18}, {"attachments": [1]},
+    {"webhook_id": 3}, {"author": {"id": 43, "bot": True}},
+    {"author": {"id": 42, "bot": False}}, {"embeds": [{"url": "unknown"}]},
+])
+def test_busy_untrusted_and_extra_content_controls(change):
+    message = {**build_busy_notice("busy"), "author": {"id": 42, "bot": True}, "type": 19}
+    message.update(change)
+    assert not is_trusted_nonconversational_message(message, {"42"})
