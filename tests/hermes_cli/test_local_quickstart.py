@@ -27,6 +27,19 @@ def client(tmp_path, monkeypatch):
     return test_client
 
 
+@pytest.fixture
+def sufficient_hardware(monkeypatch):
+    """Sequencing tests need a servable machine, not the runner's physical RAM.
+
+    Keep real catalog recommendation/selection; only its hardware input is fixed.
+    """
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    budget = HardwareBudget(64 * 1024**3, 64 * 1024**3, 0, uma=True)
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget", lambda **kwargs: budget)
+
+
 def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -45,14 +58,17 @@ def test_quickstart_unknown_model_404s(client):
 def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     """Preflight is synchronous: a machine no catalog entry fits gets a 409
     with guidance, not a doomed background job."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
     monkeypatch.setattr(
-        "hermes_cli.local_runtime.catalog.select_variant", lambda *a, **k: None)
+        "hermes_cli.local_runtime.hardware.probe_budget",
+        lambda **kwargs: HardwareBudget(0, 0, 0, uma=True))
     r = client.post("/api/local-models/quickstart", json={})
     assert r.status_code == 409
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path, sufficient_hardware):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -113,7 +129,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, monkeypatch, sufficient_hardware):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
