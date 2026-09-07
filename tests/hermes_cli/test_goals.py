@@ -536,9 +536,9 @@ class TestJudgeDrivenWait:
         mgr.set("g")
         mgr.wait_for_seconds(120, reason="backoff")
         assert mgr.is_waiting() is True
-        # Force the deadline into the past → barrier auto-clears.
-        mgr.state.waiting_until = time.time() - 1
-        assert mgr.is_waiting() is False
+        # Advance the clock past the persisted deadline, not just a cached object.
+        with patch("hermes_cli.goals.time.time", return_value=mgr.state.waiting_until + 1):
+            assert mgr.is_waiting() is False
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):

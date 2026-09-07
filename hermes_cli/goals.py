@@ -1434,14 +1434,36 @@ class GoalManager(GoalFencingMixin):
         return True
 
     def is_waiting(self) -> bool:
-        """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
-        (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
-        also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
-        otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
-        the work it was polling)."""
-        s = self._state
-        if s is None:
+        """Automatic eligibility check shared by evaluator and idle CLI/TUI callers.
+
+        Retained owners always park. Expiry is not an explicit unwait: clear only
+        the exact unclaimed snapshot, preserving its generation, counters and tokens.
+        A changed row is rechecked, never rebound to the old expiry decision.
+        """
+        self._check_store()
+        for _ in range(3):
+            state, raw = _read_goal(self.session_id)
+            self._state = state
+            if state is None or state.status != "active":
+                return False
+            if state.evaluation_id:
+                return True
+            if not (state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until):
+                return False
+            if self._wait_barrier_holds(state):
+                return True
+            expired = deepcopy(state)
+            expired.clear_wait()
+            try:
+                _cas_goal(self.session_id, raw, expired)
+            except GoalConflict:
+                continue
+            self._state = expired
             return False
+        # No provider/turn/queue admission when eligibility could not be established.
+        return True
+
+    def _wait_barrier_holds(self, s: GoalState) -> bool:
         if s.waiting_on_session is not None:
             still = _session_waiting(s.waiting_on_session)
         elif s.waiting_on_pid is not None:
@@ -1449,7 +1471,6 @@ class GoalManager(GoalFencingMixin):
         elif s.waiting_until:
             still = time.time() < s.waiting_until
             if still and s.waiting_on_delegations > 0:
-                # Set because of live delegations: lift the moment one of them returned.
                 live = count_active_delegations(self.session_id)
                 if live < s.waiting_on_delegations:
                     still = False
@@ -1459,10 +1480,7 @@ class GoalManager(GoalFencingMixin):
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
-        if not still:
-            self.stop_waiting()
         return still
-
     # --- the main entry point called after every turn -----------------
 
     def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:

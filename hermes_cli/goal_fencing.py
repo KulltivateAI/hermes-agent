@@ -167,21 +167,18 @@ class GoalFencingMixin:
             worker._state = state
             if not worker.is_active():
                 return g._decision(state.status if state else None, False, None, 'inactive', 'no active goal', '')
-            if worker.is_waiting():
-                return worker._waiting_decision(worker.state)
-            after_wait = identity(worker.state)
-            state, raw = g._read_goal(self.session_id)
-            worker._state = state
-            if identity(state) != after_wait:
-                raise g.GoalConflict('goal changed while resolving wait')
-            if not worker.is_active():
-                raise g.GoalConflict('goal changed while resolving wait')
             expected = identity(state)
             for _ in range(3):
-                if identity(state) != expected:
+                waiting = worker.is_waiting()
+                state = worker.state
+                if identity(state) != expected or not worker.is_active():
                     raise g.GoalConflict('goal changed before evaluation claim')
                 if state.evaluation_id:
                     return g._decision(state.status, False, None, 'claimed', 'evaluation already claimed; explicit resume recovers interruption', '')
+                if waiting:
+                    return worker._waiting_decision(state)
+                # Claim precisely the snapshot that passed eligibility, including on retries.
+                raw = state._goal_provenance[2]
                 state.goal_id = state.goal_id or str(uuid.uuid4())
                 state.evaluation_id = str(uuid.uuid4())
                 if state.turns_used < state.max_turns:
@@ -196,7 +193,7 @@ class GoalFencingMixin:
                     worker._evaluation_owner = (*identity(state), state.evaluation_id)
                     break
                 except g.GoalConflict:
-                    state, raw = g._read_goal(self.session_id)
+                    continue
             else:
                 raise g.GoalConflict('evaluation claim lost')
             decision = (worker._budget_pause(state, 'budget', 'turn allowance already exhausted') if exhausted else
