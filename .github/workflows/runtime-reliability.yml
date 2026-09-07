@@ -35,6 +35,8 @@ jobs:
             tests/test_state_meta_cas.py \
             tests/hermes_cli/test_goal_gates.py \
             tests/hermes_cli/test_goal_generation_fencing.py \
+            tests/hermes_cli/test_goal_wait_eligibility.py \
+            tests/scripts/test_contributor_workflow_range.py \
             tests/hermes_cli/test_goal_delivery_ownership.py \
             tests/hermes_cli/test_goals.py \
             tests/hermes_cli/test_goals_db_bootstrap_off_loop.py \

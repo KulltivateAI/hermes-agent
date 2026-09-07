@@ -21,6 +21,15 @@
 - Shared command parser reserves committed kickoff/resume fences; reservation conflict reports error with no prompt. Shared delivery helpers support pending validation and single-consumer continuation/notice claims.
 - **Compatibility:** CLI/TUI command parity, two real post-turn/followup cycles without consuming gateway-only tokens, loaded-state save, positional GoalState constructor, session-control revision, migration/compression and gate authorization preserved.
 
+## R1 independent-review correction
+
+Konsult REQUEST_CHANGES on `a21cb844bc4547b7f9c7af7795ffd6bf893480bd` controls this loop; the earlier shell/gate/lane scoped approval is not approval of these new runtime/CI bytes. Native continuation claim: same card/worktree, run5382.
+
+- Runtime commit `d0c43be686`: shared `is_waiting()` reloads state, parks retained owners, and conditionally expires only the exact unclaimed row without advancing control generation or clearing tokens. Every evaluator CAS attempt uses the snapshot that passed owner/status/wait eligibility; conflicts return to the same full eligibility check. Explicit resume/unwait remain controls. Nine native manager/real-CLI regressions went RED→GREEN. The unchanged `konsult_pr1_state_probes.py ... --expect-safe` now returns exit0 with all three predicates true. Broader canonical+preservation:28 files/404 passed. Reintroduced owner-loss/expiry-rebinding/ignored-wait mutations failed3/3/2 respectively, then were restored.
+- Separate CI correction: validate original PR-event base/head objects, bounded missing-object fetch, reject unrelated/noncommit/malformed objects, use event `base..head` rather than checkout/main; non-PR calls perform no new attribution audit. Thirteen literal-step Git-fixture cases went RED→GREEN; hardcoded-range and missing-author-gate mutations fail2/1. Only `hello@kulltivate.ai → KulltivateAI` mapped via existing primitive, verified against GitHub's original commit API.
+- Actual unassigned jobs documented by GitHub IDs101873731659(Python96),101873731100(JS32),101873731741(Rust32),101873731751(Windows32),101873732189(Nix32), all runner_id0; repository runner inventory0 and hosted-runner lookup404. No accessible matching assignment was found; no account/billing-cause claim. Standard-runner fallback is restricted to `KulltivateAI/hermes-agent`; upstream labels unchanged. Python full suite uses4 workers/90-minute finite bound, JS all checks uses concurrency2, Nix all outputs max-jobs2/cores2; Rust and native Windows retain host-sized/default bounded execution. Complete payloads, provisioning, permissions, callers and aggregate gates preserved by structural YAML comparison. No other runner jobs modified.
+- Final local focused lane includes both regression files:22 files/307 passed. Actual hosted exact-head results are required and recorded in the subsequent PR handoff, not inferred from these edits. `ci-reviewed` remains reviewer-owned and absent pending new CI review. PR1/PR2/combined activation boundaries below are unchanged.
+
 ## Frozen shared contract for PR2
 
 `GoalCommandResult.goal_fence` and evaluation `decision['goal_fence']`:
