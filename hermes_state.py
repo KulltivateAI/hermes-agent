@@ -1246,6 +1246,28 @@ class SessionDB(
         else:
             self._write_sql(sql, (key, value))
 
+    def compare_and_set_meta(
+        self, updates: dict[str, tuple[str | None, str]], *, patience_s: float | None = None,
+    ) -> bool:
+        """Atomically compare exact raw values and replace all or none. None means absent.
+
+        Patience is the native write-retry allowance, not a total lock deadline.
+        Errors (including ambiguous commits) propagate; they are never success.
+        """
+        def _do(conn):
+            for key, (expected, _) in updates.items():
+                row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+                if (None if row is None else row[0]) != expected:
+                    return False
+            cursor = conn.cursor()
+            try:
+                for key, (_, replacement) in updates.items():
+                    self.set_meta(key, replacement, cursor=cursor)
+            finally:
+                cursor.close()
+            return True
+        return self._execute_write(_do, patience_s=patience_s)
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban`` by cwd under the board's workspaces
         root; gated once per root via state_meta. Returns rows retagged."""

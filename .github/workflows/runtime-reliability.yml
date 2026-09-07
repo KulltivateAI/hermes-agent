@@ -1,0 +1,51 @@
+name: Runtime reliability
+
+on:
+  pull_request:
+    branches: [review-base/runtime-reliability-869228c]
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-reliability-acceptance:
+    name: runtime-reliability-acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+      - name: Locked isolated dependencies
+        run: uv sync --locked --python 3.11 --extra dev --extra messaging
+      - name: Exact source and interpreter
+        run: |
+          git rev-parse HEAD
+          .venv/bin/python -c 'import sys, sqlite3, pytest, hermes_cli.goals as g; print(sys.executable, sqlite3.sqlite_version, pytest.__version__, g.__file__)'
+      - name: PR1 state, shell, gates and shared compatibility
+        run: |
+          bash scripts/run_tests.sh -j 4 \
+            tests/tools/test_snapshot_invocation_authority.py \
+            tests/tools/test_snapshot_session_id_leak.py \
+            tests/tools/test_snapshot_multiline_session_env_injection.py \
+            tests/test_state_meta_cas.py \
+            tests/hermes_cli/test_goal_gates.py \
+            tests/hermes_cli/test_goal_generation_fencing.py \
+            tests/hermes_cli/test_goal_delivery_ownership.py \
+            tests/hermes_cli/test_goals.py \
+            tests/hermes_cli/test_goals_db_bootstrap_off_loop.py \
+            tests/hermes_cli/test_goal_judge_timeout_config.py \
+            tests/hermes_cli/test_goal_judge_delegations.py \
+            tests/hermes_cli/test_goal_dispatch.py \
+            tests/hermes_cli/test_kanban_goal_mode.py \
+            tests/gateway/test_goal_gate_access.py \
+            tests/gateway/test_session_env.py \
+            tests/cli/test_cli_goal_interrupt.py \
+            tests/cli/test_cli_goal_parked_resume.py \
+            tests/tui_gateway/test_goal_command.py \
+            tests/tui_gateway/test_session_control.py \
+            tests/agent/test_compression_rotation_state.py

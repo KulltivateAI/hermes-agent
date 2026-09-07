@@ -227,7 +227,8 @@ class TestStructuredRead:
         assert before == _control(server, sid)
 
         if kind == "goal":
-            _save_goal(key, goal="A visible replacement goal")
+            from hermes_cli.goals import GoalManager
+            GoalManager(key).set("A visible replacement goal")
         elif kind == "loop":
             _save_loop(key, prompt="A visibly changed loop prompt")
         else:
