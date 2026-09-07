@@ -529,9 +529,17 @@ def _cwd_marker(session_id: str) -> str:
 # as the Python-side contract for the exclusion set; the dump path unsets by
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_DELEGATED_CHILD_CONTEXT|HERMES_KANBAN_)"
 )
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _snapshot_invocation_env_names() -> tuple[str, ...]:
+    """Canonical invocation identity/authority, never persistent shell state."""
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+    from gateway.session_context import _VAR_MAP
+
+    return (*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER, *KANBAN_ENV_KEYS, "AI_AGENT", "HERMES_AGENT")
 
 
 def _export_dump_excluding_session_vars(
@@ -564,7 +572,7 @@ def _export_dump_excluding_session_vars(
     # Quote caller-provided names so malformed configuration can never become
     # shell syntax. Valid environment names remain unquoted by shlex.quote().
     safe_names = {
-        name for name in excluded_names
+        name for name in (*_snapshot_invocation_env_names(), *excluded_names)
         if isinstance(name, str) and name
     }
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
@@ -572,7 +580,7 @@ def _export_dump_excluding_session_vars(
         extra_unset = f" {extra_unset}"
     return (
         "{ ( "
-        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} ${!HERMES_KANBAN_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers
         # (re-exported by every _wrap_command with outer-harness-preserving
         # ${VAR:-default} semantics).  Persisting them into the snapshot
@@ -874,7 +882,11 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
+        # The incoming process env has already been resolved by the canonical
+        # session/delegation bridge. A legacy snapshot must not override it,
+        # including when an authority marker was deliberately absent. Keep
+        # this per-command, not on the shared Environment or in os.environ.
+        for name in sorted(set(passthrough_names) | set(_snapshot_invocation_env_names())):
             marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"

@@ -4312,7 +4312,13 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
-        task_id = getattr(self, "session_id", None) or ""
+        # Review forks borrow session_id for prompt-cache attribution, never
+        # ownership of the parent's processes/environments/browser/CUA state.
+        task_id = (
+            getattr(self, "_resource_owner_task_id", None)
+            or getattr(self, "session_id", None)
+            or ""
+        )
 
         # 1. Kill background processes for this task
         try:
