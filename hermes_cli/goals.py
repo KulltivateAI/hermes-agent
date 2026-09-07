@@ -29,7 +29,6 @@ Nothing in this module touches the agent's system prompt or toolset.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -445,8 +444,8 @@ class GoalGate:
     attempts: int = 0
     last_exit_code: Optional[int] = None
     last_output_tail: str = ""
-    # Workspace fingerprint at the time of the last FAILED run — used to skip
-    # re-running an identical gate when nothing changed since it failed.
+    # Legacy serialized field, retained for compatibility only. Never reuse
+    # a gate result based on a workspace fingerprint.
     last_failed_fingerprint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -465,36 +464,6 @@ class GoalGate:
             last_output_tail=str(data.get("last_output_tail") or ""),
             last_failed_fingerprint=str(data.get("last_failed_fingerprint") or ""),
         )
-
-
-def workspace_fingerprint(cwd: Optional[str] = None) -> str:
-    """Cheap workspace change fingerprint for unchanged-gate skip.
-
-    Uses ``git status --porcelain`` + ``git rev-parse HEAD`` when inside a git
-    repo (covers tracked edits, stages, and commits). Outside git, returns
-    an empty string — an empty fingerprint never matches, so gates simply
-    always re-run (safe fallback, no behavior regression for non-repo work).
-    """
-    workdir = cwd or os.getcwd()
-    try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10, cwd=workdir,
-        )
-        if head.returncode != 0:
-            return ""
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=30, cwd=workdir,
-        )
-        if status.returncode != 0:
-            return ""
-        blob = head.stdout.strip() + "\n" + status.stdout
-        return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()
-    except Exception:
-        return ""
 
 
 def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
@@ -1496,26 +1465,16 @@ class GoalManager:
         either a continuation carrying the gate's output (attempts left)
         or an auto-pause (retries exhausted).
 
-        An unchanged workspace since the last failure of the same gate is
-        NOT re-run — the recorded failure is replayed and the attempt count
-        advances, so a stalled agent can't spin re-running an identical red
-        suite (mirrors Prime-Agent's unchanged-gate rule).
+        Always execute fresh evidence. Git status/HEAD cannot identify edits
+        to an already-dirty file, external state, or another worktree targeted
+        by the command. Retry and turn budgets still bound repeated failures.
         """
         state = self._state
         if state is None or not state.gates:
             return None
 
-        fingerprint = workspace_fingerprint()
         for gate in state.gates:
-            unchanged = (
-                bool(fingerprint)
-                and gate.last_exit_code not in (None, 0)
-                and gate.last_failed_fingerprint == fingerprint
-            )
-            if unchanged:
-                passed, exit_code, tail = False, int(gate.last_exit_code or -1), gate.last_output_tail
-            else:
-                passed, exit_code, tail = run_gate(gate)
+            passed, exit_code, tail = run_gate(gate)
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:
@@ -1524,8 +1483,7 @@ class GoalManager:
                 continue
 
             gate.attempts += 1
-            gate.last_failed_fingerprint = fingerprint
-            skipped_note = " (workspace unchanged since last failure — not re-run)" if unchanged else ""
+            gate.last_failed_fingerprint = ""
 
             if gate.attempts > gate.max_retries:
                 state.status = "paused"
@@ -1564,7 +1522,7 @@ class GoalManager:
                 "reason": f"gate failed (exit {exit_code}): $ {gate.command}",
                 "message": (
                     f"✗ Quality gate failed ({state.turns_used}/{state.max_turns} turns, "
-                    f"attempt {gate.attempts}/{gate.max_retries}){skipped_note}: $ {gate.command}"
+                    f"attempt {gate.attempts}/{gate.max_retries}): $ {gate.command}"
                 ),
             }
 
@@ -2136,7 +2094,6 @@ __all__ = [
     "parse_contract",
     "draft_contract",
     "run_gate",
-    "workspace_fingerprint",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",

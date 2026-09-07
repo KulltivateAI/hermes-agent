@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import os
+import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -886,6 +887,10 @@ def _run_review_in_thread(
                 # rebuild path, but these pins guarantee parity even
                 # if a future code path bypasses the cache.
                 review_agent.session_start = agent.session_start
+            # Cache/transcript attribution is not resource ownership. Pin a
+            # private task namespace before borrowing the parent's session id;
+            # both tool dispatch and close() must use this same namespace.
+            review_agent._resource_owner_task_id = str(uuid.uuid4())
             review_agent.session_id = agent.session_id
             # The fork shares the parent's live session_id (pinned above for
             # prefix-cache parity). It is single-lifecycle and calls close()
@@ -973,6 +978,7 @@ def _run_review_in_thread(
                     else messages_snapshot
                 )
                 review_agent.run_conversation(
+                    task_id=review_agent._resource_owner_task_id,
                     user_message=(
                         prompt
                         + "\n\nYou can only call memory and skill "
