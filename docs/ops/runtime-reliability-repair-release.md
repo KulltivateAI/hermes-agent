@@ -50,8 +50,10 @@ and fails before running if any explicitly named test file is missing. The runne
 otherwise silently ignores nonexistent paths; a preliminary selection exposed that
 with a misspelled pure-guardrail path, which was corrected (not waived).
 
-Actual complete local execution of the corrected literal step: **43 files,
-537 passed, 0 failed**, 21.6 seconds, four workers. The wider earlier native gateway
+Actual complete local execution after R4–R6 corrections: **43 files,
+546 passed, 0 failed**, 22.1 seconds, four workers. The earlier reviewed
+`3dbc11f` candidate passed 537 locally but failed hosted cold-bootstrap acceptance;
+that failure is corrected, not waived. The wider earlier native gateway
 run had 7,998 passed / 8 failed / 41 skipped. Seven failures reproduced on the exact
 unchanged PR1 base under the same macOS interpreter (path limits, platform-specific
 fixtures and optional XML dependency); the one introduced loop-fixture prerequisite
@@ -71,11 +73,32 @@ real AIAgent initialization/controller and gateway busy-mode/steer paths with a
 fake provider client and a held/released harmless future. The config-path selector
 keeps loader bootstrap and normalization caches in TEMP; config parsing, defaults,
 environment expansion and machine-managed policy are not mocked. Explicit fictional
-provider/context metadata prevents unrelated endpoint discovery. Network attempts
+provider/context metadata prevents unrelated endpoint discovery. Only the unrelated
+Tirith binary installer entry point is substituted before construction, so a cold
+host cannot download during this offline check; security policy is not disabled
+or changed. This does not certify live Tirith installation. Network attempts
 fail acceptance. Tests verify no inspected-profile bytes or directories change,
 secret-sentinel omission, and failure on disabled hard stops or wrong busy mode.
 JSON identifies source/imports/interpreter, source SHA, dirty worktree and harness
 hash. A TEMP agent is explicitly **not** an observed live cached gateway agent.
+
+### Completed R4–R6 correction evidence
+
+- Native recursive slash safety now honors `allow_gateway_control`; generated
+  `/stop` and `/status` remain conversational goal text and reach real admission,
+  while actual commands and eventless slash text retain the safety net.
+- The already-selected `test_background_review.py` now runs success and ordinary
+  crash through the native worker and inherited real `AIAgent.release_clients`.
+  Physical process/environment/browser/CUA/memory cleanup is intercepted and
+  asserted absent; fork clients are released. No cleanup implementation changed.
+- Effective-config tests assert real agent configuration equality even for rejected
+  settings, rather than accepting any failure as the intended negative result.
+  Normal and forced-cold binary lookup cases retain zero-network/no-profile-write
+  assertions. UTF-8 fixture writes satisfy the Windows portability gate.
+- All five required correction/mutation probes failed with the named protection
+  removed, restored source bytes exactly, then passed. Exact targets, commands and
+  observed results: [mutation receipts](runtime-reliability-mutation-receipts.md).
+  This supersedes the historical section below leaving PR2 mutations pending.
 
 ### External installation/rollback gate (not executed)
 
@@ -100,8 +123,12 @@ hash. A TEMP agent is explicitly **not** an observed live cached gateway agent.
    settings, and native shell/gate/goal/queue acceptance. Saved config or PID alone
    is insufficient. Do not mark the repair accepted until this evidence exists.
 5. On failed adoption, external operator uses supported lifecycle to restore the
-   captured prior source and target settings, restarts the same consumer set, and
-   verifies rollback. Never erase goal rows, worktrees, sessions or authority markers.
+   captured prior SOURCE, restarts the same previously active consumer set, and
+   verifies rollback. Retain the approved `hard_stop_enabled:true` and
+   `non_interactive_hard_stop_enabled:true` settings; do not restore the old
+   false/absent policy. Source rollback is not a live-database or blanket settings
+   rollback. Never erase/restore goal rows, worktrees, sessions or authority markers,
+   and never enable a previously disabled service or change unrelated profiles.
    Keep feature work and unattended dispatch held until accepted.
 
 This package does not grant unattended Engineering Graph activation authority.

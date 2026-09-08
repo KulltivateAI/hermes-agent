@@ -161,10 +161,15 @@ def run_acceptance(profile_home):
             # None of these construction-only values are applied to the inspected profile.
             config['model'] = {'default': 'openai/gpt-4.1-mini', 'provider': 'custom',
                                'base_url': 'https://offline.invalid/v1', 'context_length': 128000}
-            (home / 'config.yaml').write_text(json.dumps(config))
+            (home / 'config.yaml').write_text(json.dumps(config), encoding='utf-8')
             os.environ['HERMES_HOME'] = str(home)
             token = set_hermes_home_override(str(home))
             stack.callback(reset_hermes_home_override, token)
+            # Binary installation is not part of this offline construction check.
+            # Do not disable security policy or alter the inspected profile; replace
+            # only the unrelated downloader entry point before runtime construction.
+            stack.enter_context(patch('tools.tirith_security.ensure_installed', return_value=None))
+            report['fixture_substitutions'] = ['provider client', 'tirith binary bootstrap']
             from run_agent import AIAgent
             from gateway.run import GatewayRunner
             from gateway.config import GatewayConfig

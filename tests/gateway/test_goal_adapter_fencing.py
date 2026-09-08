@@ -45,6 +45,39 @@ def env(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('word', ['/stop', '/status'])
+async def test_generated_slash_goal_reaches_native_drain_and_admission(env, word):
+    runner, source, adapter, mgr, _ = env
+    runner._adapter_and_key_for = lambda e: (adapter, 'key')
+    runner._get_goal_manager_for_event = AsyncMock(return_value=(mgr, NS(session_id='session')))
+    await runner._handle_goal_command(MessageEvent(text='/goal ' + word, source=source))
+    queued = adapter._pending_messages['key']
+    event, pending = await runner._run_agent_drain_pending(
+        {'final_response': 'parent finished', 'messages': []}, adapter, source, 'key')
+    assert event is queued
+    assert pending == word and event.get_command() is None
+    runner._run_agent_inner = AsyncMock(return_value={'final_response': 'goal accepted'})
+    result = await runner._run_agent(message=pending, context_prompt='', history=[], source=source,
+                                    session_id='session', goal_event=event)
+    assert result['final_response'] == 'goal accepted'
+    runner._run_agent_inner.assert_awaited_once()
+    assert not mgr.continuation_pending(event.metadata['hermes_goal'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('eventless', [False, True])
+async def test_pending_slash_safety_net_retains_actual_control_protection(env, eventless):
+    runner, source, adapter, _, _ = env
+    result = {'final_response': 'parent finished'}
+    if eventless:
+        result['pending_steer'] = '/status'
+    else:
+        runner._enqueue_fifo('key', MessageEvent(text='/status', source=source), adapter)
+    event, pending = await runner._run_agent_drain_pending(result, adapter, source, 'key')
+    assert event is None and pending is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('authorized', [True, False])
 @pytest.mark.parametrize('synthetic', [True, False])
 async def test_actual_adapter_busy_route_must_not_steer_stale_goal(env, authorized, synthetic):

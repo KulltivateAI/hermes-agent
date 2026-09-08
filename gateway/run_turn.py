@@ -3327,8 +3327,10 @@ class GatewayTurnMixin:
             pending = result.get("pending_steer")
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
-        # Safety net: a pending slash command is never passed to the agent as user input.
-        if pending and pending.strip().startswith("/"):
+        # Keep actual commands out of agent input, but honor explicitly non-control
+        # events (e.g. a goal whose conversational content starts with a slash).
+        if (pending and pending.strip().startswith("/")
+                and (pending_event is None or pending_event.allow_gateway_control)):
             _pending_cmd_word = pending.strip().split(None, 1)[0][1:].lower()
             if _pending_cmd_word:
                 with suppress(Exception):
