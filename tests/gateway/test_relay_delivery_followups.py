@@ -37,7 +37,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.relay.ws_transport import (
     _DISCONNECT_DRAIN_GRACE_S,
     _TEARDOWN_AWAIT_TIMEOUT_S,
@@ -275,6 +275,9 @@ async def test_request_response_fails_fast_when_closing():
 
 def _fallback_runner():
     runner = object.__new__(GatewayRunner)
+    # Cold reconstruction now checks canonical key isolation; provide the same
+    # configuration a normally constructed runner always carries.
+    runner.config = GatewayConfig()
     store = MagicMock()
     store._ensure_loaded = MagicMock(side_effect=RuntimeError("store down"))
     store._entries = {}

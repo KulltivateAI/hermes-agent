@@ -60,6 +60,8 @@ jobs:
             tests/gateway/test_completion_profile_routing.py
             tests/gateway/test_background_process_notifications.py
             tests/gateway/test_relay_injection_egress_priming.py
+            tests/gateway/test_relay_completion_injection_routing.py
+            tests/gateway/test_relay_delivery_followups.py
             tests/gateway/test_multiplex_phase0.py
             tests/gateway/test_goal_status_notice.py
             tests/gateway/test_goal_verdict_send.py

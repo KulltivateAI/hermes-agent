@@ -90,6 +90,8 @@ async def test_injection_still_none_when_platform_not_fronted():
     evt = _slack_async_event()
     evt["session_key"] = "agent:main:discord:dm:123:456"
     evt["platform"] = "discord"
+    evt["chat_id"] = "123"  # exercise no transport, not a contradictory Slack/Discord route
+    evt["thread_id"] = "456"
 
     result = await runner._inject_watch_notification("[x]", evt)
     assert result is None
