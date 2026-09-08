@@ -75,6 +75,76 @@ async def test_known_synthetic_missing_or_malformed_identity_fails_closed(contex
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('barrier', ['owner', 'wait', 'budget'])
+async def test_continuation_claim_rechecks_eligibility_after_preflight(context, monkeypatch, barrier):
+    import time
+    import uuid
+    runner, source, mgr = context
+    event = continuation(source, mgr)
+    consume = goals.GoalManager.consume_continuation
+    def raced(manager, fence, **kwargs):
+        state, raw = goals._read_goal('session')
+        if barrier == 'owner':
+            state.evaluation_id = str(uuid.uuid4())
+        elif barrier == 'wait':
+            state.waiting_until = time.time() + 60
+        else:
+            state.turns_used = state.max_turns
+        goals._cas_goal('session', raw, state)
+        return consume(manager, fence, **kwargs)
+    monkeypatch.setattr(goals.GoalManager, 'consume_continuation', raced)
+    await run(runner, source, event)
+    runner._run_agent_inner.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['unavailable', 'corrupt'])
+async def test_goal_storage_failure_never_admits_synthetic_work(context, monkeypatch, failure):
+    runner, source, mgr = context
+    event = continuation(source, mgr)
+    if failure == 'unavailable':
+        monkeypatch.setattr(goals, '_get_session_db', lambda: None)
+    else:
+        goals._get_session_db().set_meta('goal:session', '{broken json')
+    await run(runner, source, event)
+    runner._run_agent_inner.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_truly_absent_goal_snapshot_cannot_adopt_a_later_goal(context, monkeypatch):
+    from unittest.mock import Mock
+    runner, source, _ = context
+    event = MessageEvent(text='ordinary work', source=source)
+    result = await runner._run_agent(message=event.text, context_prompt='', history=[], source=source,
+                                     session_id='previously-absent', goal_event=event)
+    assert result['_goal_turn']['goal_id'] is None
+    mgr = goals.GoalManager('previously-absent')
+    mgr.set('later goal')
+    judge = Mock(side_effect=AssertionError('old turn must not judge new goal'))
+    monkeypatch.setattr(goals, 'judge_goal', judge)
+    decision = mgr.evaluate_after_turn('ordinary work completed', expected_goal=result['_goal_turn'])
+    assert decision['verdict'] == 'stale'
+    judge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_migration_preserves_goal_but_invalidates_old_queued_intent(context):
+    runner, source, mgr = context
+    old_event = continuation(source, mgr)
+    assert goals.migrate_goal_to_session('session', 'compressed-session')
+    moved = goals.GoalManager('compressed-session')
+    assert moved.state.goal == mgr.state.goal
+    assert moved.state.max_turns == mgr.state.max_turns
+    await runner._run_agent(message=old_event.text, context_prompt='', history=[], source=source,
+                             session_id='compressed-session', goal_event=old_event)
+    runner._run_agent_inner.assert_not_called()
+    current_event = continuation(source, moved)
+    await runner._run_agent(message=current_event.text, context_prompt='', history=[], source=source,
+                             session_id='compressed-session', goal_event=current_event)
+    runner._run_agent_inner.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_old_user_turn_cannot_judge_replacement_goal(context, monkeypatch):
     runner, source, mgr = context
     result = await run(runner, source, MessageEvent(text='work', source=source))
@@ -145,7 +215,7 @@ async def test_busy_goal_event_never_steers_or_interrupts_inflight_work(context)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('change', ['none', 'replace', 'previously_absent'])
+@pytest.mark.parametrize('change', ['none', 'replace', 'previously_absent', 'pause_during_notice'])
 async def test_post_turn_hook_uses_admitted_goal_not_later_goal(context, monkeypatch, change):
     runner, source, mgr = context
     adapter = SimpleNamespace(_pending_messages={}, send=AsyncMock(), _active_sessions={})
@@ -160,8 +230,12 @@ async def test_post_turn_hook_uses_admitted_goal_not_later_goal(context, monkeyp
     event = MessageEvent(text='work', source=source)
     result = await run(runner, source, event)
     event._goal_turn = result['_goal_turn']
-    if change != 'none':
+    if change in {'replace', 'previously_absent'}:
         mgr.set('replacement')
+    if change == 'pause_during_notice':
+        async def pause_notice(*args, **kwargs):
+            mgr.pause()
+        runner._defer_goal_status_notice_after_delivery = pause_notice
     from unittest.mock import Mock
     judge = Mock(return_value=('continue', 'more work', False, None, False))
     monkeypatch.setattr(goals, 'judge_goal', judge)
@@ -170,6 +244,9 @@ async def test_post_turn_hook_uses_admitted_goal_not_later_goal(context, monkeyp
         judge.assert_called_once()
         queued = adapter._pending_messages['key']
         assert goals.GoalManager('session').continuation_pending(queued.metadata['hermes_goal'])
+    elif change == 'pause_during_notice':
+        judge.assert_called_once()
+        assert adapter._pending_messages == {}
     else:
         judge.assert_not_called()
         assert adapter._pending_messages == {}
@@ -177,7 +254,8 @@ async def test_post_turn_hook_uses_admitted_goal_not_later_goal(context, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_command_producer_and_delayed_notice_keep_committed_fences(context, monkeypatch):
+@pytest.mark.parametrize('command', ['/goal resume', '/goal /stop'])
+async def test_command_producer_and_delayed_notice_keep_committed_fences(context, monkeypatch, command):
     runner, source, mgr = context
     adapter = SimpleNamespace(_pending_messages={}, send=AsyncMock(), _active_sessions={})
     callbacks = []
@@ -186,9 +264,11 @@ async def test_command_producer_and_delayed_notice_keep_committed_fences(context
     runner._adapter_for_source = lambda source: adapter
     runner._session_key_for_source = lambda source: 'key'
     runner._get_goal_manager_for_event = AsyncMock(return_value=(mgr, SimpleNamespace(session_id='session')))
-    await runner._handle_goal_command(MessageEvent(text='/goal resume', source=source))
+    await runner._handle_goal_command(MessageEvent(text=command, source=source))
     queued = adapter._pending_messages['key']
     assert mgr.continuation_pending(queued.metadata['hermes_goal'])
+    assert queued.allow_gateway_control is False
+    assert queued.get_command() is None
     monkeypatch.setattr(goals, 'judge_goal', lambda *a, **kw: ('done', 'verified', False, None, False))
     decision = mgr.evaluate_after_turn('done')
     await runner._defer_goal_status_notice_after_delivery(source, decision['message'],

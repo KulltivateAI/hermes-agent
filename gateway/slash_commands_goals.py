@@ -90,7 +90,7 @@ class GatewayGoalCommandsMixin:
                     source=event.source,
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
-                    metadata={"hermes_goal": fence},
+                    metadata={"hermes_goal": fence}, allow_gateway_control=False,
                 )
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:

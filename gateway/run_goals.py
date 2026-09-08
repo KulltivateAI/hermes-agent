@@ -38,7 +38,7 @@ class GatewayGoalsMixin:
             mgr = GoalManager(session_id)
             if synthetic:
                 fence = event.metadata["hermes_goal"]
-                if mgr.is_waiting() or not mgr.consume_continuation(fence):
+                if mgr.is_waiting() or not mgr.consume_continuation(fence, require_eligible=True):
                     return False, None
                 return True, dict(fence)
             state, _ = _read_goal(session_id)
@@ -312,6 +312,8 @@ class GatewayGoalsMixin:
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
+        if not await self._run_in_executor_with_context(lambda: mgr.continuation_pending(fence)):
+            return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
             adapter = self._adapter_for_source(source)
@@ -319,6 +321,7 @@ class GatewayGoalsMixin:
             if adapter and _quick_key:
                 turn = self._synthetic_prompt_event(source, prompt)
                 turn.metadata["hermes_goal"] = fence
+                turn.allow_gateway_control = False
                 self._enqueue_fifo(_quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)

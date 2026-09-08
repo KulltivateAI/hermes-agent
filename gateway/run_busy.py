@@ -139,17 +139,6 @@ class GatewayBusySessionMixin:
             self._peek_session_state(session_key).conversation.queued_events = kept
         return removed
 
-    def _goal_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued continuation."""
-        if not session_id:
-            return False
-        try:
-            from hermes_cli.goals import GoalManager
-            return GoalManager(session_id=session_id).is_active()
-        except Exception as exc:
-            logger.debug("goal continuation: active-state recheck failed: %s", exc)
-            return False
-
     def _get_max_concurrent_sessions(self) -> Optional[int]:
         """Return the configured active chat session cap, if enabled."""
         try:
@@ -663,6 +652,11 @@ class GatewayBusySessionMixin:
             )
             return True  # handled (silently dropped); do not fall through
 
+        if self._is_goal_continuation_event(event):
+            # The adapter calls this boundary directly, bypassing _handle_message.
+            # Keep authorization above; never turn synthetic intent into a steer.
+            self._enqueue_fifo(session_key, event, self._adapter_for_source(event.source))
+            return True
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)

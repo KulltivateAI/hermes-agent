@@ -117,12 +117,20 @@ class GoalFencingMixin:
         except g.GoalPersistenceError:
             return False
 
-    def _consume_delivery(self, fence, token):
+    def _consume_delivery(self, fence, token, *, require_eligible=False):
         from hermes_cli import goals as g
         self._check_store()
         for _ in range(3):
             state, raw = g._read_goal(self.session_id)
             if not self._matches_fence(state, fence, token):
+                return False
+            # Token consumption is also used by non-gateway receipt bookkeeping.
+            # Only agent-turn admission imposes eligibility on this exact CAS row.
+            if require_eligible and (
+                state.evaluation_id or state.turns_used >= state.max_turns or
+                state.waiting_on_pid is not None or state.waiting_on_session is not None or
+                state.waiting_until
+            ):
                 return False
             setattr(state, token, '')
             try:
@@ -132,9 +140,9 @@ class GoalFencingMixin:
                 continue
         raise g.GoalPersistenceError('delivery claim busy; no admission, explicit resume required')
 
-    def consume_continuation(self, fence):
-        """True admits exactly one event; False is stale/duplicate/malformed. Errors fail closed."""
-        return self._consume_delivery(fence, 'continuation_id')
+    def consume_continuation(self, fence, *, require_eligible=False):
+        """Consume once; gateway admission additionally checks eligibility atomically."""
+        return self._consume_delivery(fence, 'continuation_id', require_eligible=require_eligible)
 
     def consume_notice(self, fence):
         """Claim immediately before send. An ambiguous send is never retried."""

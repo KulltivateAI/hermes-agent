@@ -1962,6 +1962,10 @@ class GatewayTurnMixin:
                 message_type=event.message_type, goal_event=event,
             )
             event._goal_turn = agent_result.get("_goal_turn")
+            if agent_result.get("_goal_rejected"):
+                # No turn occurred. Do not normalize into a retry hint, persist
+                # synthetic user/history rows, or clear successful-recovery state.
+                return None
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             await self._hmwa_stop_typing_for_turn(event, source)
@@ -3438,12 +3442,6 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
-                return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
             try:
@@ -3497,6 +3495,14 @@ class GatewayTurnMixin:
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
             message_type=next_message_type, goal_event=pending_event,
         )
+        if followup_result.get("_goal_rejected"):
+            # Preserve the completed parent's result and ownership. Its visible
+            # response was already handled above; a rejection is not a new answer.
+            # Leave promoted real input in the native adapter slot for its drain.
+            prior = dict(response if isinstance(response, dict) else result)
+            if not result.get("interrupted"):
+                prior["already_sent"] = True
+            return prior
         return _preserve_queued_followup_history_offset(result, followup_result)
 
     async def _run_agent_cleanup_turn_tasks(
