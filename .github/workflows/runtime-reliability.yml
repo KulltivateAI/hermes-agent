@@ -57,6 +57,10 @@ jobs:
             tests/gateway/test_runtime_repair_effective_config.py
             tests/gateway/test_goal_continuation_drain.py
             tests/gateway/test_goal_resume_restart.py
+            tests/gateway/test_completion_profile_routing.py
+            tests/gateway/test_background_process_notifications.py
+            tests/gateway/test_relay_injection_egress_priming.py
+            tests/gateway/test_multiplex_phase0.py
             tests/gateway/test_goal_status_notice.py
             tests/gateway/test_goal_verdict_send.py
             tests/gateway/test_loop_command.py

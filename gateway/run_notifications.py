@@ -754,26 +754,51 @@ class GatewayNotificationsMixin:
                 platform, home, transport, message, "state.db warning notification failed for %s:%s: %s",
             )
 
+    def _completion_session_route(self, session_key: str) -> Optional[dict]:
+        """Completion-local namespace support; not a general inverse of session keys."""
+        from gateway.run import _parse_session_key
+        parts = session_key.split(":")
+        if len(parts) < 5 or parts[0] != "agent" or not all(parts[1:5]):
+            return None
+        from gateway.session_recovery import SessionRecoveryMixin
+        profile = SessionRecoveryMixin._profile_from_session_key(session_key)
+        if profile == "default":
+            parsed = _parse_session_key(session_key)
+            return {**parsed, "profile": None} if parsed else None
+        # A namespace is independent of Slack scope prefixes / colon-bearing IDs.
+        # Only Discord has the unambiguous named-profile ID layout qualified here.
+        route = {"profile": profile, "platform": parts[2], "chat_type": parts[3]}
+        if parts[2] == "discord":
+            route.update(_parse_session_key("agent:main:" + ":".join(parts[2:])) or {})
+        return route
+
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
 
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
         """
-        from gateway.run import _parse_session_key
         session_key = str(evt.get("session_key") or "").strip()
-        derived = {}
+        derived = self._completion_session_route(session_key) or {}
+        explicit_profile = evt.get("profile")
+        if explicit_profile is not None and (not isinstance(explicit_profile, str)
+                or explicit_profile != explicit_profile.strip()):
+            return None
+        if derived and explicit_profile and (explicit_profile or "default") != (derived.get("profile") or "default"):
+            return None
         if session_key:
+            origin = None
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
-                if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                origin = getattr(entry, "origin", None)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
-            cached_source = self._get_cached_session_source(session_key)
-            if cached_source is not None:
-                return cached_source
-            derived = _parse_session_key(session_key) or {}
+            if origin is None:
+                origin = self._get_cached_session_source(session_key)
+            if origin is not None:
+                if derived and (getattr(origin, "profile", None) or "default") != (derived.get("profile") or "default"):
+                    return None
+                return origin
         platform_name = str(evt.get("platform") or derived.get("platform") or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived.get("chat_type") or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived.get("chat_id") or "").strip()
@@ -811,8 +836,10 @@ class GatewayNotificationsMixin:
                 "the connector's tenant guard (user_id fallback only).", platform_name, chat_id, chat_type,
             )
         return SessionSource(
-            platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=_opt("thread_id"),
+            platform=platform, chat_id=chat_id, chat_type=chat_type,
+            thread_id=_opt("thread_id") or derived.get("thread_id"),
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id,
+            profile=explicit_profile or derived.get("profile"),
         )
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
@@ -865,18 +892,29 @@ class GatewayNotificationsMixin:
             logger.warning(fail, raw_sid, e)
             return False
 
-    def _resolve_injection_adapter(self, platform_name: str):
-        """Adapter for a synthetic-event platform: alias-aware transport resolver first (one
-        Platform.RELAY adapter fronts N logical platforms; native wins), literal ``p.value`` scan as
-        fallback for minimal runner stubs / exotic platform strings when the resolver can't run."""
+    def _resolve_injection_adapter(self, platform_name: str, source=None):
+        """Honor recorded transport/profile ownership, then primary relay eligibility."""
         from gateway.delivery import resolve_delivery_transport
+        if source is not None:
+            owner = self._transport_owner(source)
+            profile = getattr(source, "profile", None)
+            if owner is not None:
+                if owner[1] is not None:
+                    return self._adapter_for_source(source)
+            elif getattr(source, "delivered_via_upstream_relay", False) is True:
+                return self._adapter_for_source(source)
+            elif profile and profile != "default" and (
+                profile in self._profile_adapters_map()
+                or profile != getattr(self, "_primary_profile_name", None)
+            ):
+                # No fallback to another bot when the named owner is disconnected.
+                return self._adapter_for_source(source)
         try:
-            _transport = resolve_delivery_transport(Platform(platform_name), self.config, self.adapters)
+            transport = resolve_delivery_transport(Platform(platform_name), self.config, self.adapters)
         except Exception:
-            _transport = None
-        if _transport is not None:
-            return _transport.adapter
-        return self._adapter_by_platform_value(platform_name)
+            # Minimal stubs/exotic platforms only; an explicit disabled config is not a miss.
+            return self._adapter_by_platform_value(platform_name)
+        return transport.adapter if transport is not None else None
 
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
@@ -885,14 +923,16 @@ class GatewayNotificationsMixin:
         ``True`` on adapter acceptance, ``False`` on retryable adapter failure, ``None`` with no
         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
         """
-        from gateway.run import _parse_session_key
         from gateway.wake import adapter_supports_push
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
-            raw_sid = str(evt.get("origin_session_id") or "").strip()
             _sk = str(evt.get("session_key") or "").strip()
-            if not raw_sid and _sk and _parse_session_key(_sk) is None:
+            if _sk.startswith("agent:"):
+                # A temporarily unavailable structured source is never a raw API session.
+                return False
+            raw_sid = str(evt.get("origin_session_id") or "").strip()
+            if not raw_sid and _sk:
                 raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
@@ -909,9 +949,9 @@ class GatewayNotificationsMixin:
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = self._resolve_injection_adapter(platform_name)
+        adapter = self._resolve_injection_adapter(platform_name, source)
         if not adapter:
-            return None
+            return False if getattr(source, "profile", None) not in (None, "", "default") else None
         if not adapter_supports_push(adapter):
             # Non-push adapter (api_server): its chat_id IS the raw session id, so handle_message would
             # key the wake under a build_session_key() that never matches — self-post instead.
@@ -1267,17 +1307,12 @@ class GatewayNotificationsMixin:
         Such events only carry ``session_key`` (the daemon worker lacks per-message routing
         metadata). Best-effort: a CLI-origin event (empty session_key) is left as-is and won't route.
         """
-        from gateway.run import _parse_session_key
-        if evt.get("platform"):
-            return  # already enriched
-        parsed = _parse_session_key(evt.get("session_key", "") or "")
+        parsed = self._completion_session_route(evt.get("session_key", "") or "")
         if not parsed:
             return
-        evt["platform"] = parsed.get("platform", "")
-        evt["chat_type"] = parsed.get("chat_type", "")
-        evt["chat_id"] = parsed.get("chat_id", "")
-        if parsed.get("thread_id"):
-            evt["thread_id"] = parsed["thread_id"]
+        for field in ("profile", "platform", "chat_type", "chat_id", "thread_id"):
+            if not evt.get(field) and parsed.get(field) is not None:
+                evt[field] = parsed[field]
 
     @staticmethod
     def _settle_sibling_claims(siblings: list[tuple[dict, str]], fn, fail_msg: str) -> None:
