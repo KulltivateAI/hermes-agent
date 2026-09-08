@@ -128,6 +128,10 @@ class GatewayInboundMixin:
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
+        # Native input lifetime starts before capture, including cold internal turns.
+        from gateway.session_context import begin_native_input
+        begin_native_input()
+
         # Most adapters resolve profile routes in build_source(); internal/voice paths construct
         # SessionSource directly, so resolve those here as the shared fail-closed ingress gate.
         # Strict boolean marker: require the literal True so duck-typed test/internal sources with

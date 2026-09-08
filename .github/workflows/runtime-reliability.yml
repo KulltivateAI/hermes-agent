@@ -47,6 +47,10 @@ jobs:
             tests/hermes_cli/test_kanban_goal_mode.py
             tests/gateway/test_goal_gate_access.py
             tests/gateway/test_session_env.py
+            tests/gateway/test_native_input_lifetime.py
+            tests/gateway/test_session_context_inheritance.py
+            tests/run_agent/test_steer.py
+            tests/gateway/test_steer_command.py
             tests/cli/test_cli_goal_interrupt.py
             tests/cli/test_cli_goal_parked_resume.py
             tests/tui_gateway/test_goal_command.py

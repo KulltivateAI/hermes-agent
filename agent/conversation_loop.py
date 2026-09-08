@@ -276,6 +276,8 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
     empty-response storms); the interruption scaffold is replay text carried only in the user
     correction's ``api_content``; an on-screen-empty placeholder is ``display_kind=hidden``."""
+    from gateway.session_context import advance_native_input
+    advance_native_input()
     visible = agent._strip_think_blocks(getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
 
     checkpoint_parts = [_INTERRUPT_SCAFFOLD_MARKER]
