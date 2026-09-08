@@ -167,3 +167,87 @@ async def test_unavailable_secondary_is_retryable_and_acknowledged_only_after_ac
             acknowledge.assert_called_once()
     finally:
         runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('origin_location', ['stored', 'cached'])
+@pytest.mark.parametrize('multiplex', [False, True])
+async def test_real_session_namespace_preserves_its_named_primary(origin_location, multiplex, monkeypatch, tmp_path):
+    runner, primary, _, _ = runner_fixture(monkeypatch, tmp_path)
+    try:
+        runner.config.multiplex_profiles = multiplex
+        runner.session_store.config = runner.config
+        source = SessionSource(platform=Platform.DISCORD, chat_id='123', profile='operator')
+        key = runner.session_store._generate_session_key(source)
+        if origin_location == 'stored':
+            runner.session_store._entries[key] = SimpleNamespace(origin=source)
+        else:
+            runner._cache_session_source(key, source)
+        assert await runner._inject_watch_notification('owned result', {'session_key': key}) is True
+        assert primary.events[0].source.profile == 'operator'
+        primary.events.clear()
+        assert await runner._inject_watch_notification('conflict', {'session_key': key, 'profile': 'alpha'}) is False
+        assert not primary.events
+    finally:
+        runner._shutdown_executor()
+
+
+@pytest.mark.parametrize('case', [
+    'group-participant', 'channel-participant', 'thread-participant',
+    'slack-direct', 'slack-enriched', 'slack-thread-direct', 'slack-thread-enriched',
+    'bad-namespace-space', 'bad-namespace-empty', 'bad-chat-empty',
+    'conflicting-chat', 'conflicting-platform', 'conflicting-type', 'conflicting-thread',
+])
+def test_cold_route_preserves_identity_or_refuses(case, monkeypatch, tmp_path):
+    runner, primary, secondary, relay = runner_fixture(monkeypatch, tmp_path)
+    try:
+        source = SessionSource(platform=Platform.DISCORD, chat_id='123', chat_type='dm', profile='alpha')
+        if case.endswith('participant'):
+            source.chat_type = case.split('-')[0]
+            source.user_id = 'owner'
+            if source.chat_type == 'thread':
+                runner.config.thread_sessions_per_user = True
+                source.thread_id = '42'
+            key = build_session_key(source, profile='alpha', thread_sessions_per_user=runner.config.thread_sessions_per_user)
+            evt = {'session_key': key}
+            recovered = runner._build_process_event_source(evt)
+            assert recovered is None or build_session_key(recovered, profile='alpha',
+                thread_sessions_per_user=runner.config.thread_sessions_per_user) == key
+            # Explicit participant/thread metadata must still recover the original route.
+            evt.update(platform='discord', chat_type=source.chat_type, chat_id='123', user_id='owner')
+            if source.thread_id:
+                evt['thread_id'] = source.thread_id
+            recovered = runner._build_process_event_source(evt)
+            assert recovered is not None
+            assert recovered.user_id == source.user_id and recovered.thread_id == source.thread_id
+        elif case.startswith('slack-'):
+            source = SessionSource(platform=Platform.SLACK, chat_id='D123', scope_id='T123',
+                                   chat_type='dm', thread_id='42' if 'thread' in case else None)
+            evt = {'session_key': build_session_key(source), 'platform': 'slack', 'chat_type': 'dm',
+                   'chat_id': 'D123', 'scope_id': 'T123'}
+            if source.thread_id:
+                evt['thread_id'] = source.thread_id
+            if case.endswith('enriched'):
+                runner._enrich_async_delegation_routing(evt)
+            recovered = runner._build_process_event_source(evt)
+            assert recovered is not None
+            assert (recovered.chat_id, recovered.scope_id, recovered.thread_id) == ('D123', 'T123', source.thread_id)
+        else:
+            evt = {'session_key': build_session_key(source, profile='alpha'),
+                   'platform': 'discord', 'chat_type': 'dm', 'chat_id': '123'}
+            changes = {
+                'bad-namespace-space': {'session_key': 'agent: alpha:discord:dm:123'},
+                'bad-namespace-empty': {'session_key': 'agent::discord:dm:123'},
+                'bad-chat-empty': {'session_key': 'agent:alpha:discord:dm:'},
+                'conflicting-chat': {'chat_id': '999'},
+                'conflicting-platform': {'platform': 'telegram'},
+                'conflicting-type': {'chat_type': 'group'},
+                'conflicting-thread': {'thread_id': '42'},
+            }
+            evt.update(changes[case])
+            assert runner._build_process_event_source(evt) is None
+            runner._enrich_async_delegation_routing(evt)
+            assert runner._build_process_event_source(evt) is None
+            assert not primary.events and not secondary.events and not relay.events
+    finally:
+        runner._shutdown_executor()

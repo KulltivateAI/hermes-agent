@@ -755,36 +755,68 @@ class GatewayNotificationsMixin:
             )
 
     def _completion_session_route(self, session_key: str) -> Optional[dict]:
-        """Completion-local namespace support; not a general inverse of session keys."""
+        """Read only qualified key fields; scoped/participant layouts need origin metadata."""
         from gateway.run import _parse_session_key
-        parts = session_key.split(":")
-        if len(parts) < 5 or parts[0] != "agent" or not all(parts[1:5]):
-            return None
         from gateway.session_recovery import SessionRecoveryMixin
+        from hermes_cli.profiles import validate_profile_name
+        parts = session_key.split(":")
+        if (len(parts) < 5 or parts[0] != "agent"
+                or any(not part or part != part.strip() for part in parts[1:])):
+            return None
+        if parts[1] != "main":
+            try:
+                validate_profile_name(parts[1])
+            except ValueError:
+                return None
+            if parts[1] == "default":  # the canonical default namespace is main
+                return None
         profile = SessionRecoveryMixin._profile_from_session_key(session_key)
-        if profile == "default":
-            parsed = _parse_session_key(session_key)
-            return {**parsed, "profile": None} if parsed else None
-        # A namespace is independent of Slack scope prefixes / colon-bearing IDs.
-        # Only Discord has the unambiguous named-profile ID layout qualified here.
-        route = {"profile": profile, "platform": parts[2], "chat_type": parts[3]}
-        if parts[2] == "discord":
-            route.update(_parse_session_key("agent:main:" + ":".join(parts[2:])) or {})
+        profile = None if profile == "default" else profile
+        platform, chat_type = parts[2].lower(), parts[3].lower()
+        route = {"profile": profile, "platform": platform, "chat_type": chat_type}
+        # Slack scope prefixes and generic colon-bearing IDs cannot be inverted here.
+        if platform != "slack" and (profile is None or platform == "discord"):
+            if platform in {"discord", "telegram"} or len(parts) == 5:
+                parsed = _parse_session_key("agent:main:" + ":".join(parts[2:])) or {}
+                route["chat_id"] = parsed["chat_id"]
+                if chat_type == "dm" and len(parts) == 5:
+                    route["thread_id"] = None
+                elif len(parts) == 6 and (chat_type == "dm" or (
+                    chat_type == "thread" and not getattr(self.config, "group_sessions_per_user", True)
+                )):
+                    route["thread_id"] = parts[5]
         return route
+
+    def _completion_profile_matches(self, keyed_profile, actual_profile) -> bool:
+        """Standalone named primaries legitimately retain the legacy main namespace."""
+        keyed, actual = keyed_profile or "default", actual_profile or "default"
+        if keyed == actual:
+            return True
+        return (keyed == "default" and not getattr(self.config, "multiplex_profiles", False)
+                and actual == getattr(self, "_primary_profile_name", None))
 
     def _build_process_event_source(self, evt: dict):
         """Resolve the canonical source for a synthetic background-process event.
 
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
         """
-        session_key = str(evt.get("session_key") or "").strip()
+        session_key = str(evt.get("session_key") or "")
         derived = self._completion_session_route(session_key) or {}
+        if session_key.lstrip().startswith("agent:") and not derived:
+            return None  # malformed structured metadata is not an absent/raw key
         explicit_profile = evt.get("profile")
         if explicit_profile is not None and (not isinstance(explicit_profile, str)
                 or explicit_profile != explicit_profile.strip()):
             return None
-        if derived and explicit_profile and (explicit_profile or "default") != (derived.get("profile") or "default"):
+        if derived and explicit_profile and not self._completion_profile_matches(derived.get("profile"), explicit_profile):
             return None
+        for field in ("platform", "chat_type", "chat_id", "thread_id"):
+            if field in derived and evt.get(field):
+                actual = str(evt[field])
+                if field in {"platform", "chat_type"}:
+                    actual = actual.lower()
+                if actual != derived[field]:
+                    return None
         if session_key:
             origin = None
             try:
@@ -796,7 +828,7 @@ class GatewayNotificationsMixin:
             if origin is None:
                 origin = self._get_cached_session_source(session_key)
             if origin is not None:
-                if derived and (getattr(origin, "profile", None) or "default") != (derived.get("profile") or "default"):
+                if derived and not self._completion_profile_matches(derived.get("profile"), getattr(origin, "profile", None)):
                     return None
                 return origin
         platform_name = str(evt.get("platform") or derived.get("platform") or "").strip().lower()
@@ -835,12 +867,23 @@ class GatewayNotificationsMixin:
                 "without scope_id; scoped relay egress may be declined by "
                 "the connector's tenant guard (user_id fallback only).", platform_name, chat_id, chat_type,
             )
-        return SessionSource(
+        source = SessionSource(
             platform=platform, chat_id=chat_id, chat_type=chat_type,
             thread_id=_opt("thread_id") or derived.get("thread_id"),
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id,
             profile=explicit_profile or derived.get("profile"),
         )
+        if derived and platform in {Platform.DISCORD, Platform.TELEGRAM}:
+            from gateway.session import build_session_key
+            parts = session_key.split(":")
+            parts[2:4] = [platform.value, chat_type]
+            recovered_key = build_session_key(source,
+                group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+                thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+                profile=derived.get("profile"))
+            if recovered_key != ":".join(parts):
+                return None  # missing participant/thread metadata must not change the conversation
+        return source
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume queued watch events and inject them when notifications are enabled.
