@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -221,6 +223,58 @@ def test_background_review_releases_clients_without_closing_shared_session(monke
         "run_conversation",
         "release_clients",
     ]
+
+
+@pytest.mark.parametrize('crash', [False, True])
+def test_native_review_worker_preserves_parent_resources_on_success_and_crash(monkeypatch, crash):
+    """Exercise the native worker + AIAgent release; intercept only physical teardown."""
+    from unittest.mock import Mock
+    from agent.background_review import _run_review_in_thread
+    from tools.process_registry import process_registry
+    import tools.computer_use.tool as cua
+
+    physical = [Mock() for _ in range(5)]
+    kill, vm, browser, computer, memory = physical
+    monkeypatch.setattr(process_registry, 'list_sessions', lambda: [
+        {'owner_task_id': 'parent-task', 'status': 'running', 'session_id': 'parent-process'}])
+    monkeypatch.setattr(process_registry, 'kill_process', kill)
+    monkeypatch.setattr(run_agent_module, 'cleanup_vm', vm)
+    monkeypatch.setattr(run_agent_module, 'cleanup_browser', browser)
+    monkeypatch.setattr(cua, 'release_computer_use_session', computer)
+    forks = []
+
+    class ReviewFork(AIAgent):
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get('session_id', 'test-session')
+            self._session_messages = []
+            self._active_children = []
+            self._active_children_lock = threading.Lock()
+            self._process_owner_task_ids = {'parent-task'}
+            self.client = Mock()
+            self._retire_shared_openai_client = Mock()  # physical socket retirement
+            self.shutdown_memory_provider = memory
+            self._trim_process_memory = Mock()
+            self._finalize_owned_session_row = Mock()
+            forks.append(self)
+
+        def run_conversation(self, **kwargs):
+            if crash:
+                raise RuntimeError('ordinary review worker crash')
+            return {'final_response': 'review finished'}
+
+    monkeypatch.setattr(run_agent_module, 'AIAgent', ReviewFork)
+    parent = _bare_agent()
+    parent._emit_auxiliary_failure = Mock()
+    _run_review_in_thread(parent, [{'role': 'user', 'content': 'fixture'}], 'review')
+    assert len(forks) == 1
+    fork = forks[-1]
+    assert fork.session_id == parent.session_id
+    for cleanup in physical:
+        cleanup.assert_not_called()
+    assert fork.client is None, 'real release_clients must release the fork client'
+    fork._retire_shared_openai_client.assert_called_once()
+    assert bool(parent._emit_auxiliary_failure.called) is crash
+    assert parent._active_children == []
 
 
 def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):

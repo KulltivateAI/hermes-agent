@@ -603,6 +603,11 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if self._is_goal_continuation_event(event):
+            # Synthetic intent is admitted only at a new turn's fenced boundary;
+            # even a valid continuation must never become an in-flight steer.
+            self._enqueue_fifo(_quick_key, event, self._adapter_for_source(source))
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result

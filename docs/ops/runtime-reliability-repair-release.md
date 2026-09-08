@@ -1,4 +1,142 @@
-# Runtime reliability repair — PR1 release checkpoint
+# Runtime reliability repair — combined release candidate
+
+## PR2 candidate — current, supersedes historical pending-PR1 text below
+
+PR1 is merged only to `review-base/runtime-reliability-869228c` as
+`2691170b1d0224309ca06a4a8520f648ca43bf15`; reviewed head was
+`6650bbf8eb6ef69ae199a6e47f887d5b39c0d488`. All applicable hosted checks passed.
+PR2 is based on that actual merge, on `repair/runtime-reliability-gateway`.
+Konsult authors and owns delivery under the current single-owner policy;
+independent reviewers, never the author, provide exact-head approval.
+No installation, profile-setting change, gateway restart or dispatcher activation
+is performed by this PR. Creative/pricing remain paused.
+
+### Gateway implementation and review corrections
+
+- Both registered adapter busy callbacks and the runner busy path retain known
+  synthetic goal events in FIFO; neither steers/redirects/interrupts with them.
+  Real-user authorization remains before the adapter's synthetic guard.
+- Direct and recursive callers pass event identity through awaited preparation
+  to the shared profile-scoped admission claim. Rejection is a no-turn outcome:
+  direct callers skip reply/history/recovery-success handling; recursive callers
+  preserve the completed parent result and suppress a duplicate response.
+  Native adapter drain retains the following real event and its media.
+- Removed the inherited status-only recursive precheck and its synchronous reader.
+  `consume_continuation(..., require_eligible=True)` makes gateway eligibility
+  (owner/WAIT/budget) part of the exact CAS row check. Default receipt consumption
+  remains compatible with PR1's evaluator/delivery bookkeeping contract.
+- Captured ordinary-turn identity, including truly absent goals, fences post-turn
+  judgment. Producers preserve committed fences, disable slash/control parsing
+  of generated text, and recheck pending identity before enqueue. Deferred notices
+  claim once at send time; ambiguous delivery is not automatically retried.
+- Goal-aware media/text merge retains whole event objects and real-user priority.
+  Startup replay, late adapter drain, orphan rescue and recursive-followup tests
+  exercise native lifecycle paths. Known-synthetic shutdown snapshots remain manual
+  recovery artifacts, not ordinary user transcript instructions. Goal migration
+  preserves state while invalidating old queued identity; fresh identity can enter.
+
+Initial independent core review at `ec616a3dc034d563832c521dbd83f6de1fb1f744`
+returned REQUEST_CHANGES (adapter busy bypass, no-turn result handling, duplicate
+recursive reply). Author reran the unchanged reviewer probes: four failed and one
+passed before correction; all five passed afterward. Native regressions are in
+`tests/gateway/test_goal_adapter_fencing.py`. This records author correction evidence,
+not a new independent approval. Final exact-head review and hosted CI remain gates.
+
+### Re-runnable combined acceptance
+
+The final shell step in `.github/workflows/runtime-reliability.yml` is canonical.
+It retains every PR1 selection, adds gateway/configuration/preservation coverage,
+and fails before running if any explicitly named test file is missing. The runner
+otherwise silently ignores nonexistent paths; a preliminary selection exposed that
+with a misspelled pure-guardrail path, which was corrected (not waived).
+
+Actual complete local execution after R4–R6 corrections: **43 files,
+546 passed, 0 failed**, 22.1 seconds, four workers. The earlier reviewed
+`3dbc11f` candidate passed 537 locally but failed hosted cold-bootstrap acceptance;
+that failure is corrected, not waived. The wider earlier native gateway
+run had 7,998 passed / 8 failed / 41 skipped. Seven failures reproduced on the exact
+unchanged PR1 base under the same macOS interpreter (path limits, platform-specific
+fixtures and optional XML dependency); the one introduced loop-fixture prerequisite
+was corrected. Those seven are not counted as passing or removed from hosted CI.
+Full applicable hosted CI must still pass on the exact final candidate.
+
+The offline adoption harness is:
+
+```bash
+<selected-python> <selected-source>/scripts/runtime_reliability_acceptance.py \
+  --profile-home <explicit-profile-home>
+```
+
+It uses an isolated worker process and TEMP runtime objects, reads only allowlisted
+settings from the actual target file through the canonical loader, and exercises
+real AIAgent initialization/controller and gateway busy-mode/steer paths with a
+fake provider client and a held/released harmless future. The config-path selector
+keeps loader bootstrap and normalization caches in TEMP; config parsing, defaults,
+environment expansion and machine-managed policy are not mocked. Explicit fictional
+provider/context metadata prevents unrelated endpoint discovery. Only the unrelated
+Tirith binary installer entry point is substituted before construction, so a cold
+host cannot download during this offline check; security policy is not disabled
+or changed. This does not certify live Tirith installation. Network attempts
+fail acceptance. Tests verify no inspected-profile bytes or directories change,
+secret-sentinel omission, and failure on disabled hard stops or wrong busy mode.
+JSON identifies source/imports/interpreter, source SHA, dirty worktree and harness
+hash. A TEMP agent is explicitly **not** an observed live cached gateway agent.
+
+### Completed R4–R6 correction evidence
+
+- Native recursive slash safety now honors `allow_gateway_control`; generated
+  `/stop` and `/status` remain conversational goal text and reach real admission,
+  while actual commands and eventless slash text retain the safety net.
+- The already-selected `test_background_review.py` now runs success and ordinary
+  crash through the native worker and inherited real `AIAgent.release_clients`.
+  Physical process/environment/browser/CUA/memory cleanup is intercepted and
+  asserted absent; fork clients are released. No cleanup implementation changed.
+- Effective-config tests assert real agent configuration equality even for rejected
+  settings, rather than accepting any failure as the intended negative result.
+  Normal and forced-cold binary lookup cases retain zero-network/no-profile-write
+  assertions. UTF-8 fixture writes satisfy the Windows portability gate.
+- All five required correction/mutation probes failed with the named protection
+  removed, restored source bytes exactly, then passed. Exact targets, commands and
+  observed results: [mutation receipts](runtime-reliability-mutation-receipts.md).
+  This supersedes the historical section below leaving PR2 mutations pending.
+
+### External installation/rollback gate (not executed)
+
+1. Record the final independent exact-head verdict, actual applicable green CI and
+   PR2 merge SHA in the release receipt. Verify merged tree equality to the reviewed
+   candidate. Only this combined PR2 merge is an installation target, never PR1 alone.
+2. External operator inventories every gateway importing the shared source and the
+   actual launcher/interpreter, captures prior source/configuration and preserves
+   work/session/spool state. Run the canonical acceptance step with a pytest-capable
+   test interpreter **before stopping anything**. Confirm dependencies before
+   maintenance; do not run a generic update to upstream main.
+3. Under the approved maintenance window, the external operator uses the supported
+   gateway lifecycle to stop/drain the identified source consumers, selects the
+   exact reviewed combined source, applies only the approved Arch/Konsult settings
+   from the canonical PRD through `hermes --profile <name> config set`, and restarts
+   the same consumers. Preserve other profiles, models, caps, security, memory and
+   ordinary compression. No active coordinator may restart itself or use a detached
+   process/another agent to evade a lifecycle refusal.
+4. Capture new process source identities and run the harness from the **installed**
+   source/interpreter for each target profile. Require `ok:true`, zero network
+   attempts, matching imported source, identified clean installed commit, expected
+   settings, and native shell/gate/goal/queue acceptance. Saved config or PID alone
+   is insufficient. Do not mark the repair accepted until this evidence exists.
+5. On failed adoption, external operator uses supported lifecycle to restore the
+   captured prior SOURCE, restarts the same previously active consumer set, and
+   verifies rollback. Retain the approved `hard_stop_enabled:true` and
+   `non_interactive_hard_stop_enabled:true` settings; do not restore the old
+   false/absent policy. Source rollback is not a live-database or blanket settings
+   rollback. Never erase/restore goal rows, worktrees, sessions or authority markers,
+   and never enable a previously disabled service or change unrelated profiles.
+   Keep feature work and unattended dispatch held until accepted.
+
+This package does not grant unattended Engineering Graph activation authority.
+It repairs runtime boundaries; the broader engineering mission remains separate
+from, and must not be declared complete by, this runtime release.
+
+## Historical PR1 release checkpoint
+
 
 ## Authority and release boundary
 

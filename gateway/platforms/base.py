@@ -1662,6 +1662,13 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
     existing = pending_messages.get(session_key)
+    incoming_goal = "hermes_goal" in (getattr(event, "metadata", None) or {})
+    existing_goal = "hermes_goal" in (getattr(existing, "metadata", None) or {})
+    if existing and (incoming_goal or existing_goal):
+        # A continuation is an indivisible intent, never user text to concatenate.
+        if existing_goal:
+            pending_messages[session_key] = event
+        return
     if existing:
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO

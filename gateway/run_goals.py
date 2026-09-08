@@ -26,6 +26,29 @@ logger = logging.getLogger("gateway.run")
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
 
+    def _admit_goal_turn(self, event, session_id):
+        """Consume synthetic intent once; snapshot ordinary turns without granting authority.
+
+        Runs off-loop inside the source profile scope. Claim is the admission
+        linearization point, not a transaction spanning provider execution.
+        """
+        from hermes_cli.goals import GoalManager, GoalPersistenceError, _read_goal
+        synthetic = self._is_goal_continuation_event(event)
+        try:
+            mgr = GoalManager(session_id)
+            if synthetic:
+                fence = event.metadata["hermes_goal"]
+                if mgr.is_waiting() or not mgr.consume_continuation(fence, require_eligible=True):
+                    return False, None
+                return True, dict(fence)
+            state, _ = _read_goal(session_id)
+            return True, {"session_id": session_id,
+                          "goal_id": state.goal_id if state else None,
+                          "generation": state.generation if state else None}
+        except GoalPersistenceError as exc:
+            logger.warning("goal admission unavailable: %s", exc)
+            return not synthetic, None
+
     # ── /goal — persistent cross-turn goals (Ralph-style loop) ──────────
     def _goal_max_turns_from_config(self) -> int:
         """Configured /goal turn budget. GatewayRunner.config is a GatewayConfig dataclass, so the
@@ -184,7 +207,7 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(self, source: Any, message: str, *, fence=None) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self._goal_notice_adapter(source)
         if not adapter:
@@ -192,13 +215,21 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        if fence is not None:
+            from hermes_cli.goals import GoalManager
+            with self._profile_scope_for_source(source):
+                claimed = await self._run_in_executor_with_context(
+                    lambda: GoalManager(fence.get("session_id", "")).consume_notice(fence),
+                )
+            if not claimed:
+                return
         result = await adapter.send(source.chat_id, message, metadata=metadata)
         if result is not None and not getattr(result, "success", True):
             logger.warning(
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str, *, fence=None) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
@@ -210,7 +241,7 @@ class GatewayGoalsMixin:
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(source, message, fence=fence)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
@@ -243,7 +274,7 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, expected_goal=None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -270,22 +301,28 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, expected_goal=expected_goal,
             ),
         )
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
-        if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+        fence = decision.get("goal_fence")
+        if msg and source is not None and isinstance(fence, dict):
+            await self._defer_goal_status_notice_after_delivery(source, msg, fence=fence)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
+            return
+        if not await self._run_in_executor_with_context(lambda: mgr.continuation_pending(fence)):
             return
         # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
         try:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                turn = self._synthetic_prompt_event(source, prompt)
+                turn.metadata["hermes_goal"] = fence
+                turn.allow_gateway_control = False
+                self._enqueue_fifo(_quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -304,11 +341,13 @@ class GatewayGoalsMixin:
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip():
+        snapshot = getattr(event, "_goal_turn", None)
+        if final_text.strip() and isinstance(snapshot, dict):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                kwargs = {"expected_goal": snapshot} if label == "goal continuation" else {}
+                await hook(session_entry=session_entry, source=source, final_response=final_text, **kwargs)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

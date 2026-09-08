@@ -185,6 +185,10 @@ def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        metadata = getattr(value, "metadata", None)
+        if isinstance(metadata, dict) and "hermes_goal" in metadata:
+            fence = metadata["hermes_goal"]
+            result["metadata"] = {"hermes_goal": fence if _json_safe(fence) else None}
         for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
@@ -248,6 +252,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
                                   timestamp=message.get("timestamp") or payload.get("ts"))
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    if "hermes_goal" in (data.get("metadata") or {}):
+        logger.info("Goal continuation spool %s retained for explicit resume", path)
+        return False
     text = data.get("text", "")
     if not text or not session_key:
         logger.warning("Cannot recover structurally invalid pending message from %s; "

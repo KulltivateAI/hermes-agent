@@ -1516,9 +1516,10 @@ class GoalManager(GoalFencingMixin):
         )
 
     def evaluate_after_turn(self, last_response: str, *, user_initiated: bool = True,
-                            background_processes=None, active_delegations: int = 0):
+                            background_processes=None, active_delegations: int = 0, expected_goal=None):
         return self._run_fenced_evaluation(last_response, user_initiated=user_initiated,
-            background_processes=background_processes, active_delegations=active_delegations)
+            background_processes=background_processes, active_delegations=active_delegations,
+            expected_goal=expected_goal)
 
     def _evaluate_claimed(
         self, last_response: str, *, user_initiated: bool = True,

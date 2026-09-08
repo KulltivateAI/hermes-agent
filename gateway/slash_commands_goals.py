@@ -62,7 +62,7 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
+            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff, fence=result.goal_fence)
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -74,7 +74,7 @@ class GatewayGoalCommandsMixin:
             logger.debug("goal %s: pending continuation cleanup failed: %s", verb, exc)
 
     def _enqueue_goal_turn(
-        self, event: MessageEvent, text: str, *, label: str, kickoff: bool
+        self, event: MessageEvent, text: str, *, label: str, kickoff: bool, fence=None
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
@@ -90,6 +90,7 @@ class GatewayGoalCommandsMixin:
                     source=event.source,
                     message_id=event.message_id if kickoff else None,
                     channel_prompt=event.channel_prompt if kickoff else None,
+                    metadata={"hermes_goal": fence}, allow_gateway_control=False,
                 )
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:

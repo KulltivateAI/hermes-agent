@@ -1959,8 +1959,13 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
-                message_type=event.message_type,
+                message_type=event.message_type, goal_event=event,
             )
+            event._goal_turn = agent_result.get("_goal_turn")
+            if agent_result.get("_goal_rejected"):
+                # No turn occurred. Do not normalize into a retry hint, persist
+                # synthetic user/history rows, or clear successful-recovery state.
+                return None
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             await self._hmwa_stop_typing_for_turn(event, source)
@@ -2560,8 +2565,17 @@ class GatewayTurnMixin:
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
+        event = turn_kwargs.pop("goal_event", None)
         with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+            admitted, snapshot = await self._run_in_executor_with_context(
+                lambda: self._admit_goal_turn(event, session_id),
+            )
+            if not admitted:
+                return {"final_response": "", "messages": history, "_goal_rejected": True}
+            result = await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+            if isinstance(result, dict):
+                result.setdefault("_goal_turn", snapshot)
+            return result
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3313,8 +3327,10 @@ class GatewayTurnMixin:
             pending = result.get("pending_steer")
             logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
-        # Safety net: a pending slash command is never passed to the agent as user input.
-        if pending and pending.strip().startswith("/"):
+        # Keep actual commands out of agent input, but honor explicitly non-control
+        # events (e.g. a goal whose conversational content starts with a slash).
+        if (pending and pending.strip().startswith("/")
+                and (pending_event is None or pending_event.allow_gateway_control)):
             _pending_cmd_word = pending.strip().split(None, 1)[0][1:].lower()
             if _pending_cmd_word:
                 with suppress(Exception):
@@ -3428,12 +3444,6 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
-                return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
             try:
@@ -3485,8 +3495,16 @@ class GatewayTurnMixin:
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
-            message_type=next_message_type,
+            message_type=next_message_type, goal_event=pending_event,
         )
+        if followup_result.get("_goal_rejected"):
+            # Preserve the completed parent's result and ownership. Its visible
+            # response was already handled above; a rejection is not a new answer.
+            # Leave promoted real input in the native adapter slot for its drain.
+            prior = dict(response if isinstance(response, dict) else result)
+            if not result.get("interrupted"):
+                prior["already_sent"] = True
+            return prior
         return _preserve_queued_followup_history_offset(result, followup_result)
 
     async def _run_agent_cleanup_turn_tasks(

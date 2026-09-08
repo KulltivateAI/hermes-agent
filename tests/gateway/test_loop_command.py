@@ -230,13 +230,21 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    # The gateway now judges only the goal captured when this turn was admitted.
+    # Exercise the failure-isolation branch with that real admission prerequisite.
+    from hermes_cli.goals import GoalManager
+    await runner._warm_goals_session_db("goal-hook fixture")
+    GoalManager("sid-gateway-loop").set("complete fixture work")
+    event = _make_event("wakeup")
+    _, event._goal_turn = runner._admit_goal_turn(event, "sid-gateway-loop")
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
             agent_result={"final_response": "still working"},
-            source=_make_event("wakeup").source,
+            source=event.source,
             is_internal=True,
+            event=event,
         )
 
     reloaded = loops.load_loop("sid-gateway-loop")
