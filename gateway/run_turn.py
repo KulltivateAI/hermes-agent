@@ -1959,8 +1959,9 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
-                message_type=event.message_type,
+                message_type=event.message_type, goal_event=event,
             )
+            event._goal_turn = agent_result.get("_goal_turn")
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             await self._hmwa_stop_typing_for_turn(event, source)
@@ -2560,8 +2561,17 @@ class GatewayTurnMixin:
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
+        event = turn_kwargs.pop("goal_event", None)
         with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+            admitted, snapshot = await self._run_in_executor_with_context(
+                lambda: self._admit_goal_turn(event, session_id),
+            )
+            if not admitted:
+                return {"final_response": "", "messages": history, "_goal_rejected": True}
+            result = await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+            if isinstance(result, dict):
+                result.setdefault("_goal_turn", snapshot)
+            return result
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3485,7 +3495,7 @@ class GatewayTurnMixin:
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, channel_prompt=next_channel_prompt,
-            message_type=next_message_type,
+            message_type=next_message_type, goal_event=pending_event,
         )
         return _preserve_queued_followup_history_offset(result, followup_result)
 
