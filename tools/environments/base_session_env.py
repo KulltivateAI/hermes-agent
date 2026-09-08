@@ -31,6 +31,19 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Fixed even when absent from the incoming environment: old snapshots may contain them.
+_INVOCATION_ENV_NAMES = frozenset({
+    "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
+    "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
+    "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
+    "HERMES_CRON_SESSION", "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID", "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_DELEGATED_CHILD_CONTEXT", "AI_AGENT", "HERMES_AGENT",
+})
+
 # mktemp template suffix + the shell variable holding the allocated temp path.
 _SNAP_TMP_SUFFIX = ".tmp.XXXXXXXXXX"
 _SNAP_TMP = '"$__hermes_snap_tmp"'
@@ -63,7 +76,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are ignored
     # under 2>/dev/null. Caller names are quoted so malformed config can never
     # become shell syntax (valid names stay unquoted by shlex.quote()).
-    safe_names = {name for name in excluded_names if isinstance(name, str) and name}
+    safe_names = _INVOCATION_ENV_NAMES | {
+        name for name in excluded_names if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
+    }
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
@@ -134,6 +149,9 @@ def _wrap_command_script(
     changing the command's umask.
     """
     escaped = command.replace("'", "'\\''")
+    passthrough_names = sorted(_INVOCATION_ENV_NAMES | {
+        name for name in passthrough_names if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
+    })
     save, restore = _passthrough_save_restore(passthrough_names)
     parts = list(save)
     if snapshot_ready:

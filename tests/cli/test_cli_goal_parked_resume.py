@@ -56,3 +56,18 @@ def test_idle_hook_is_a_no_op_for_an_unparked_or_inactive_goal(hermes_home):
     cli._last_goal_barrier_check = 0.0
     cli._maybe_resume_parked_goal()
     assert cli._pending_input.empty()
+
+
+def test_two_real_goal_hook_cycles_do_not_require_gateway_token_consumption(hermes_home, monkeypatch):
+    mgr = goals.GoalManager('two-cycles'); mgr.set('keep working')
+    cli = _Cli(mgr)
+    cli._last_assistant_response_text = lambda: 'work in progress'
+    monkeypatch.setattr(goals,'judge_goal',lambda *a,**k: ('continue','next',False,None,False))
+    tokens = []
+    for turn in (1,2):
+        cli._maybe_continue_goal_after_turn()
+        assert 'keep working' in cli._pending_input.get_nowait()
+        state = goals.load_goal('two-cycles')
+        assert state.turns_used == turn and not state.evaluation_id
+        tokens.append(state.continuation_id)
+    assert all(tokens) and tokens[0] != tokens[1]

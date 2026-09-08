@@ -188,8 +188,7 @@ def test_passing_gates_fall_through_to_judge():
 
 def test_gate_retry_exhaustion_pauses_goal():
     mgr = _mgr_with_goal("gate-exhaust-sid")
-    mgr.add_gate("exit 1")
-    mgr.state.gates[0].max_retries = 2
+    mgr.add_gate("exit 1", max_retries=2)
     with patch("hermes_cli.goals.judge_goal") as mock_judge, \
          patch("hermes_cli.goals.workspace_fingerprint", return_value=""):
         d1 = mgr.evaluate_after_turn("attempt one")
@@ -204,18 +203,17 @@ def test_gate_retry_exhaustion_pauses_goal():
     assert "gate" in (mgr.state.paused_reason or "")
 
 
-def test_unchanged_workspace_skips_rerun():
+def test_unchanged_workspace_runs_fresh(tmp_path):
     mgr = _mgr_with_goal("gate-unchanged-sid")
-    mgr.add_gate("exit 1")
+    receipt = tmp_path / "receipt"
+    mgr.add_gate(f'echo actual >> "{receipt}"; exit 1')
     with patch("hermes_cli.goals.workspace_fingerprint", return_value="fp-1"), \
          patch("hermes_cli.goals.judge_goal"):
         mgr.evaluate_after_turn("turn 1")
-        # Second turn, same fingerprint — run_gate must NOT run again.
-        with patch("hermes_cli.goals.run_gate") as mock_run:
-            d2 = mgr.evaluate_after_turn("turn 2")
-        mock_run.assert_not_called()
+        d2 = mgr.evaluate_after_turn("turn 2")
+    assert receipt.read_text().splitlines() == ["actual", "actual"]
     assert d2["verdict"] == "gate_failed"
-    assert "unchanged" in d2["message"]
+    assert mgr.state.gates[0].last_failed_fingerprint == ""
 
 
 def test_changed_workspace_reruns_gate():
@@ -252,3 +250,70 @@ def test_no_gates_behaves_exactly_as_before():
     mock_judge.assert_called_once()
     assert decision["verdict"] == "continue"
     assert decision["should_continue"] is True
+
+
+@pytest.mark.parametrize("reset_budget", [True, False])
+def test_explicit_resume_reopens_gate_allowance(reset_budget):
+    mgr = _mgr_with_goal()
+    mgr.add_gate("exit 1")
+    for _ in range(4):
+        mgr.evaluate_after_turn("work")
+    assert mgr.state.status == "paused"
+    mgr.resume(reset_budget=reset_budget)
+    gate = mgr.state.gates[0]
+    assert gate.attempts == 0 and gate.last_exit_code is None and gate.last_output_tail == ""
+    assert mgr.state.turns_used == (0 if reset_budget else 4)
+    assert mgr.evaluate_after_turn("fresh")["should_continue"]
+
+
+def test_preexhausted_budget_never_executes():
+    mgr = _mgr_with_goal()
+    mgr.add_gate("true")
+    mgr.state.turns_used = mgr.state.max_turns
+    save_goal(mgr.session_id, mgr.state)
+    with patch("hermes_cli.goals.run_gate") as gate, patch("hermes_cli.goals.judge_goal") as judge:
+        assert not mgr.evaluate_after_turn("work")["should_continue"]
+    gate.assert_not_called()
+    judge.assert_not_called()
+
+
+def test_already_dirty_file_and_other_worktree_have_fresh_receipts(tmp_path, monkeypatch):
+    import subprocess
+    from hermes_cli.goals import workspace_fingerprint
+    dirs = [tmp_path / "first", tmp_path / "second"]
+    for directory in dirs:
+        directory.mkdir()
+        subprocess.run(['git','init',str(directory)], check=True, capture_output=True)
+        subprocess.run(['git','-C',str(directory),'-c','user.name=Test','-c','user.email=test@example.invalid',
+                        'commit','--allow-empty','-m','fixture'], check=True, capture_output=True)
+        (directory/'receipt').write_text('dirty1')
+    mgr = _mgr_with_goal()
+    mgr.add_gate('cat receipt; test "$(cat receipt)" = pass')
+    monkeypatch.chdir(dirs[0])
+    first_fingerprint = workspace_fingerprint()
+    assert 'dirty1' in mgr.evaluate_after_turn('one')['continuation_prompt']
+    (dirs[0]/'receipt').write_text('dirty2')
+    assert workspace_fingerprint() == first_fingerprint
+    assert 'dirty2' in mgr.evaluate_after_turn('two')['continuation_prompt']
+    monkeypatch.chdir(dirs[1])
+    (dirs[1]/'receipt').write_text('pass')
+    with patch('hermes_cli.goals.judge_goal', return_value=('done','verified',False,None,False)):
+        assert mgr.evaluate_after_turn('different target')['verdict'] == 'done'
+    assert mgr.state.gates[0].attempts == 0 and mgr.state.gates[0].last_output_tail == 'pass'
+
+
+def test_launch_error_tail_and_effective_timeout_are_bounded():
+    with patch('hermes_cli.goals.subprocess.run', side_effect=OSError('x'*5000)):
+        passed, code, output = run_gate(GoalGate(command='unused'))
+    assert not passed and code == -1 and len(output) <= 3000
+    with patch('hermes_cli.goals.subprocess.run', side_effect=__import__('subprocess').TimeoutExpired('unused',1)) as launch:
+        assert run_gate(GoalGate(command='unused',timeout_seconds=-4))[1] == -1
+    assert launch.call_args.kwargs['timeout'] == 1
+
+
+def test_legacy_constructor_and_deprecated_fingerprint_serialization():
+    state = GoalState('legacy', 'paused')
+    assert state.status == 'paused'
+    state.gates.append(GoalGate('false',last_failed_fingerprint='deprecated'))
+    assert json.loads(state.to_json())['gates'][0]['last_failed_fingerprint'] == ''
+    assert GoalGate.from_dict({'command':'false','last_failed_fingerprint':'legacy'}).last_failed_fingerprint == ''

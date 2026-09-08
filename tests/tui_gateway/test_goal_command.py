@@ -442,6 +442,25 @@ def test_new_goal_does_not_inherit_previous_goal_recovery_attempt(server):
     assert GoalManager(session_key).state.status == "active"
 
 
+def test_two_real_evaluation_followups_keep_tui_transport_compatible(server, turn_env, monkeypatch):
+    from hermes_cli import goals
+    session_key = 'goal-real-followups'
+    goals.GoalManager(session_key).set('finish work')
+    prompts, judged = [], []
+    def run_conversation(message, **kwargs):
+        prompts.append(message)
+        return {'final_response':'work receipt'}
+    def judge(*a, **k):
+        judged.append(1)
+        return ('continue' if len(judged) < 3 else 'done'), 'receipt', False, None, False
+    monkeypatch.setattr(goals,'judge_goal',judge)
+    agent = types.SimpleNamespace(session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda:None)
+    server._run_prompt_submit('rid','sid',_turn_session(agent,session_key),'initial')
+    assert len(prompts) == 3 and len(judged) == 3
+    state = goals.load_goal(session_key)
+    assert state.status == 'done' and state.turns_used == 3 and not state.evaluation_id
+
+
 # ── command.dispatch /moa ────────────────────────────────────────────
 
 def _write_moa_config(home, text):

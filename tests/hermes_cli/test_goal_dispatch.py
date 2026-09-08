@@ -68,8 +68,8 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
     goals._DB_CACHE.clear()
     command = command.format(pid=os.getpid())
     snapshots = []
-    for name in ('cli', surface):
-        mgr = goals.GoalManager(session_id=name + '-parity-' + surface)
+    for index, name in enumerate(('cli', surface)):
+        mgr = goals.GoalManager(session_id=name + '-parity-' + surface + str(index))
         mgr.set('original objective')
         mgr.add_gate('original gate')
         mgr.wait_on(os.getpid(), reason='existing barrier')
@@ -80,6 +80,9 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
         if state:
             from dataclasses import asdict
             state = asdict(state)
+            # Opaque IDs differ per session; compare presence, not random UUID bytes.
+            for key in ('goal_id', 'evaluation_id', 'continuation_id', 'notice_id'):
+                state[key] = bool(state[key])
             for key in ('created_at', 'updated_at', 'waiting_since'):
                 state.pop(key, None)
         snapshots.append(state)

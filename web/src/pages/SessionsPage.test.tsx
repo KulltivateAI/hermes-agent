@@ -31,6 +31,17 @@ vi.mock("@/lib/api", () => ({
 vi.mock("@/components/PlatformsCard", () => ({ PlatformsCard: () => null }));
 vi.mock("@/components/Markdown", () => ({ Markdown: () => null }));
 
+async function loadPageModules() {
+  return Promise.all([
+    import("./SessionsPage"),
+    import("@/i18n"),
+    import("@/contexts/SystemActions"),
+    import("@/contexts/ProfileProvider"),
+    import("@/contexts/PageHeaderProvider"),
+  ]);
+}
+
+let pageModules: Awaited<ReturnType<typeof loadPageModules>>;
 let container: HTMLDivElement;
 let root: Root;
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -61,14 +72,7 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
     limit,
     offset: 0,
   }));
-  const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] =
-    await Promise.all([
-      import("./SessionsPage"),
-      import("@/i18n"),
-      import("@/contexts/SystemActions"),
-      import("@/contexts/ProfileProvider"),
-      import("@/contexts/PageHeaderProvider"),
-    ]);
+  const [{ default: SessionsPage }, { I18nProvider }, { SystemActionsProvider }, { ProfileProvider }, { PageHeaderProvider }] = pageModules;
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -90,7 +94,7 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
   await waitFor(() => Boolean(button("Delete session")));
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   for (const fn of Object.values(apiMocks)) fn.mockReset();
   apiMocks.getStatus.mockResolvedValue({});
   apiMocks.getEmptySessionsCount.mockResolvedValue({ count: 0 });
@@ -110,6 +114,9 @@ beforeEach(() => {
   vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
   vi.stubGlobal("matchMedia", () => ({ addEventListener() {}, matches: false, media: "", removeEventListener() {} }));
   sessionStorage.clear();
+  // Cold Vite compilation is fixture setup, not per-row routing behavior.
+  // Keep browser stubs in place before imports and retain the test's 5s deadline.
+  pageModules = await loadPageModules();
 });
 
 afterEach(async () => {

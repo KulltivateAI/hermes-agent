@@ -24,11 +24,44 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          set -euo pipefail
+          # Reusable callers keep the original event. Push is not a PR attribution audit.
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "No PR attribution on $GITHUB_EVENT_NAME."
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            echo "review_status=[]" > review-status.json
+            exit 0
+          fi
 
-          # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Treat event SHAs as data, not shell syntax or checkout/branch-name authority.
+          SHAS=$(python3 - <<'PY'
+          import json, os, re
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+              pr = json.load(source)["pull_request"]
+          shas = [pr[side]["sha"] for side in ("base", "head")]
+          if any(not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in shas):
+              raise SystemExit("Invalid PR base/head commit SHA")
+          print(*shas)
+          PY
+          )
+          read -r BASE HEAD <<< "$SHAS"
+          for sha in "$BASE" "$HEAD"; do
+            if ! git cat-file -e "$sha" 2>/dev/null; then
+              # Fetch only the validated object request from checkout's existing origin.
+              python3 - "$sha" <<'PY'
+          import os, subprocess, sys
+          subprocess.run(["git", "fetch", "--no-tags", "--no-recurse-submodules", "origin", sys.argv[1]],
+                         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, timeout=30, check=True)
+          PY
+            fi
+            if [ "$(git cat-file -t "$sha")" != "commit" ]; then
+              echo "::error::PR base/head must be commit objects"
+              exit 1
+            fi
+          done
+          # Related histories are required; a base-side advance need not be a head ancestor.
+          git merge-base "$BASE" "$HEAD" >/dev/null
+          NEW_EMAILS=$(git log "$BASE..$HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

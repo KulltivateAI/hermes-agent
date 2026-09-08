@@ -21,6 +21,7 @@ class GoalCommandResult:
     kickoff: bool = False
     clear_pending: str | None = None
     error: bool = False
+    goal_fence: dict | None = None
 
 
 def _english(key, default, **values):
@@ -48,8 +49,9 @@ def _resume(mgr, arg, render):
     state = mgr.resume()
     if state is None:
         return GoalCommandResult(render("gateway.goal.no_resume", "No goal to resume."))
+    fence = _reserve_prompt(mgr)
     return GoalCommandResult(render("gateway.goal.resumed", "▶ Goal resumed: {goal}", goal=state.goal),
-                             prompt=mgr.next_continuation_prompt())
+                             prompt=mgr.next_continuation_prompt(), goal_fence=fence)
 
 
 def _clear(mgr, arg, render):
@@ -152,7 +154,16 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         output += (f"\nAfter each turn, a judge model checks if the goal is done{against}. "
                    "Hermes keeps working until it is, you pause/clear it, or the budget is "
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
-    return GoalCommandResult(output, goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
+    fence = _reserve_prompt(mgr)
+    return GoalCommandResult(output, goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True,
+                             goal_fence=fence)
+
+
+def _reserve_prompt(mgr):
+    fence = mgr.reserve_continuation()
+    if fence is None:
+        raise goals.GoalConflict('control persisted, but kickoff/resume reservation lost; inspect /goal status and explicitly resume')
+    return fence
 
 
 def is_goal_control(arg: str) -> bool:
