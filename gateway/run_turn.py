@@ -3295,6 +3295,12 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            queued = getattr(adapter, '_pending_messages', {}).get(session_key)
+            if isinstance(queued, MessageEvent) and queued.internal:
+                # Internal completions need cold native route capture, not a recursive
+                # continuation with the preceding user's now-revoked input stamp.
+                # Leave the event in place for the adapter's ordinary next-turn drain.
+                return None, None
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).

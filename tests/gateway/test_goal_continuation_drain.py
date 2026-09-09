@@ -76,6 +76,60 @@ def _slack_thread_source() -> SessionSource:
 CONTINUATION_TEXT = "[Continuing toward your standing goal]\nGoal: ship it"
 
 
+@pytest.mark.asyncio
+async def test_internal_cold_handoff_preserves_existing_fifo(hermes_home):
+    from gateway.run import GatewayRunner
+
+    adapter = _DrainProbeAdapter()
+    source = _slack_thread_source()
+    key = build_session_key(source)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._queued_events = {}
+    runner._draining = False
+    runner._adapter_for_source = lambda source: adapter
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed = []
+
+    def event(text, internal=False):
+        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source,
+                            internal=internal, allow_gateway_control=not internal)
+
+    async def handler(current):
+        while current is not None:
+            observed.append(current.text)
+            if current.text == 'ordinary':
+                runner._enqueue_fifo(key, event('internal', True), adapter)
+                runner._enqueue_fifo(key, event('older-B'), adapter)
+            elif current.text == 'internal':
+                runner._hm_rescue_orphaned_fifo(current, source, True, key)
+                entered.set()
+                await release.wait()
+            elif current.text == 'newer-C':
+                finished.set()
+            pending, _ = await runner._run_agent_drain_pending(
+                {'final_response': 'done'}, adapter, source, key)
+            current = pending
+        return 'done'
+
+    adapter.set_message_handler(handler)
+    try:
+        await adapter._process_message_background(event('ordinary'), key)
+        await asyncio.wait_for(entered.wait(), 3)
+        assert key not in adapter._pending_messages
+        overflow = runner._overflow_queue(key)
+        assert overflow is not None
+        assert [item.text for item in overflow] == ['older-B']
+        runner._enqueue_fifo(key, event('newer-C'), adapter)
+        release.set()
+        await asyncio.wait_for(finished.wait(), 3)
+        assert observed == ['ordinary', 'internal', 'older-B', 'newer-C'], observed
+    finally:
+        release.set()
+        tasks = list(adapter._background_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
     from pathlib import Path

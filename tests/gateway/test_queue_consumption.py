@@ -91,6 +91,30 @@ class TestQueueMessageStorage:
 class TestQueueConsumptionAfterCompletion:
     """Verify that pending messages are consumed after normal completion."""
 
+    def test_internal_completion_keeps_cold_turn_while_plain_queue_can_recurse(self):
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        for internal in (True, False):
+            runner = GatewayRunner.__new__(GatewayRunner)
+            runner._queued_events = {}
+            runner._draining = False
+            adapter = _StubAdapter()
+            source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="200")
+            key = "telegram:user:123"
+            event = MessageEvent(text="background result" if internal else "ordinary queued work",
+                                 message_type=MessageType.TEXT, source=source,
+                                 message_id="queued-fixture", internal=internal)
+            adapter._pending_messages[key] = event
+            result = asyncio.run(runner._run_agent_drain_pending(
+                {"final_response": "prior turn finished"}, adapter, source, key))
+            if internal:
+                assert result == (None, None)
+                assert adapter._pending_messages[key] is event
+            else:
+                assert result == (event, event.text)
+                assert key not in adapter._pending_messages
+
     def test_pending_message_available_after_normal_completion(self):
         """After agent finishes without interrupt, pending message should
         still be retrievable from adapter._pending_messages."""

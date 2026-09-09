@@ -202,7 +202,10 @@ async def test_busy_goal_event_never_steers_or_interrupts_inflight_work(context)
     runner._hm_busy_slash_or_photo = AsyncMock(return_value=(False, None))
     runner._effective_busy_input_mode = lambda source: 'steer'
     runner._hm_busy_telegram_grace_queue = lambda *args: False
-    runner._peek_session_state = lambda key: SimpleNamespace(turn=SimpleNamespace(agent=agent))
+    from gateway.session_state import SessionState
+    state = SessionState()
+    state.turn.agent = agent
+    runner._peek_session_state = lambda key: state
     runner._draining = False
     event = continuation(source, mgr)
     mgr.pause()

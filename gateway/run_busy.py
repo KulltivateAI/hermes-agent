@@ -50,6 +50,11 @@ class GatewayBusySessionMixin:
             return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
+        elif overflow := self._overflow_queue(session_key):
+            # A cold handoff may empty the slot before overflow is promoted.
+            # The new arrival must follow the already-acknowledged older work.
+            pending_slot[session_key] = overflow.pop(0)
+            overflow.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
 

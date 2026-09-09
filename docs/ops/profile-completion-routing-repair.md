@@ -37,5 +37,31 @@ The native Creative tests subsequently proved explicit `/queue` recursion and su
 
 This is an additional high-risk input/session authorization change. The prior8dff0fb approval and green CI do NOT approve these new bytes. Fresh author-distinct exact-head review, green hosted CI, human high-risk signoff and supported external installation remain required. No runtime self-install, new supervisor or unattended activation is introduced. External IO admitted before replacement cannot be retroactively rolled back; the epoch lock is never held over a network await.
 
+## Cached-conversation background identity repair
+
+Creative's two-distinct-operation native fixture reproduced a second waiter with correct nonce/owner/route but empty `parent_session_id`. `_set_session_env` omitted the resolved `SessionContext.session_id`; constructing a fresh agent masked that omission, while a reused agent did not rebind the empty ContextVar. The second native acknowledgement consequently remained manual and automatic reconciliation returned only the first result.
+
+Bind `session_id=context.session_id` through the existing task-local `set_session_vars` call. No environment write, new identity primitive, snapshot relaxation, alternate delivery path or permission change. The field already exists in the context built from the authoritative session entry. Missing context identity remains explicitly empty; foreign ambient IDs must not substitute. Repeated cached turns must keep their exact identity and cleanup must still clear it.
+
+Regression: `bash scripts/run_tests.sh tests/gateway/test_session_env.py tests/gateway/test_session_context_inheritance.py tests/gateway/test_background_process_notifications.py -q`. Before correction the new known-session cases fail (2 failed/10 passed); after correction all37 tests across3 files pass. Existing runtime-reliability CI already includes these files; no workflow change. Platform native `two_distinct_operations` went RED (one missing operation) then GREEN with this single production line, using real native admission, both actual background waiters, batch/reconcile and distinct image/caption delivery. External model/HTTP/Discord sinks are synthetic; this is not live-provider proof.
+
+Done when exact-head author-distinct approval and applicable CI pass, the corrected runtime is installed through the supported release path, and Creative's named-profile delivery is verified. This session/auth-sensitive correction is in Drew's explicitly requested Creative launch scope. It remains subject to the high-risk human gate and must not self-restart an active shared gateway. No broader engineering-process redesign is part of this repair.
+
+## Queued completion must start a native turn
+
+The subsequent Creative F1 busy-completion fixture reached the actual adapter pending slot while an unrelated ordinary turn was active. The runtime then consumed the internal completion recursively, advanced the native input epoch, and reused the old route lease without cold capture; reconciliation failed with `TRUSTED_TURN_REQUIRED`. Preserve the internal `MessageEvent` in the existing adapter slot so normal next-turn dispatch performs fresh route capture and original-operation proof. Do not grant fresh user intake to an internal completion. Ordinary human queue recursion remains unchanged.
+
+`tests/gateway/test_queue_consumption.py` reproduces the premature recursive dequeue (RED1failed/5passed). After correction, queue-consumption, pending-drain-race, goal-continuation-drain and session-env tests pass23/23. The actual native `completion_queued_behind` test now verifies the internal event was queued during live ordinary work, ordinary output precedes the selected image, exact original admission survives, and a structurally valid new produce attempt in the completion is denied without a second provider request. This added runtime delta requires new exact-head independent review and CI; the prior5e9d approval does not cover it. No installed runtime or scope/permission change is claimed.
+
+## Review correction: preserve FIFO across cold handoff
+
+Independent review of `298322b16ee38882f1ac9c6e72f96a28ddd46cd5` reproduced ordinary -> internal -> newer-C -> older-B: cold adapter dispatch empties the pending slot while older human work remains in overflow. A new arrival previously occupied that empty slot ahead of acknowledged work. Retain cold internal dispatch; correct the existing `_enqueue_fifo` primitive so an empty slot first receives the oldest overflow entry, with the new arrival appended behind remaining overflow. No second queue, new scheduler, or changed input authority.
+
+The reviewer adapter-lifecycle reproduction is now a portable regression in `test_goal_continuation_drain.py`, with the real enqueue/promotion/drain/adapter flow and no real provider. Before correction it fails with the exact reversed order (1failed/2passed); after correction, the five targeted queue/goal/persistence files pass35tests, including expected ordinary -> internal -> older-B -> newer-C. Ruff and diff checks pass. Existing workflow already includes these files. This successor needs fresh exact-head independent review and CI; neither prior verdict approves it. Source was developed in a separate isolated worktree to avoid mutating the prior frozen native qualification run.
+
+## Hosted acceptance fixture correction
+
+The successor's hosted 55-file acceptance ran750passes and one failure: `test_busy_goal_event_never_steers_or_interrupts_inflight_work` supplied a turn-only `SimpleNamespace` in place of the real session state, omitting `conversation.queued_events` now read by canonical enqueue. Reproduced locally (27passed/1failed), then initialized the existing `SessionState` primitive with the same mocked in-flight agent. Assertions and production code are unchanged. The literal 55-file workflow list now passes751tests locally; hosted new-head CI and independent fixture-delta approval remain required. Do not hide the missing fixture field with a production fallback.
+
 ## Not claimed
 No generic inverse session-key parser, raw text-only watcher migration, shutdown routing redesign, new supervisor, arbitrary cold shared-transport recovery, runtime self-install or Creative pixel/fleet acceptance from fixture results.
