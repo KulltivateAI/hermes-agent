@@ -59,5 +59,9 @@ Independent review of `298322b16ee38882f1ac9c6e72f96a28ddd46cd5` reproduced ordi
 
 The reviewer adapter-lifecycle reproduction is now a portable regression in `test_goal_continuation_drain.py`, with the real enqueue/promotion/drain/adapter flow and no real provider. Before correction it fails with the exact reversed order (1failed/2passed); after correction, the five targeted queue/goal/persistence files pass35tests, including expected ordinary -> internal -> older-B -> newer-C. Ruff and diff checks pass. Existing workflow already includes these files. This successor needs fresh exact-head independent review and CI; neither prior verdict approves it. Source was developed in a separate isolated worktree to avoid mutating the prior frozen native qualification run.
 
+## Hosted acceptance fixture correction
+
+The successor's hosted 55-file acceptance ran750passes and one failure: `test_busy_goal_event_never_steers_or_interrupts_inflight_work` supplied a turn-only `SimpleNamespace` in place of the real session state, omitting `conversation.queued_events` now read by canonical enqueue. Reproduced locally (27passed/1failed), then initialized the existing `SessionState` primitive with the same mocked in-flight agent. Assertions and production code are unchanged. The literal 55-file workflow list now passes751tests locally; hosted new-head CI and independent fixture-delta approval remain required. Do not hide the missing fixture field with a production fallback.
+
 ## Not claimed
 No generic inverse session-key parser, raw text-only watcher migration, shutdown routing redesign, new supervisor, arbitrary cold shared-transport recovery, runtime self-install or Creative pixel/fleet acceptance from fixture results.
