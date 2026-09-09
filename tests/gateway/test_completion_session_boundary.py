@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from tools.process_registry import ProcessRegistry, ProcessSession
 
@@ -52,6 +52,7 @@ class _SessionDB:
 
 def _runner(adapter, *, session_db=...):
     runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)})
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.session_store = SimpleNamespace(

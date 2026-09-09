@@ -3162,6 +3162,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt).
         _requeue_pending_steer(agent, steer_text)
         return
+    from gateway.session_context import advance_native_input
+    advance_native_input()
     marker = format_steer_marker(steer_text)
     existing_content = target.get("content", "")
     if isinstance(existing_content, str):

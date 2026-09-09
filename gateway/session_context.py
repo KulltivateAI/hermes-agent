@@ -6,9 +6,108 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 """
 
 import os
+import asyncio
+import weakref
+from dataclasses import dataclass
+from threading import RLock
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
+
+class NativeInputExpired(ValueError):
+    """A frozen native-input capability is absent, detached or no longer current."""
+
+    def __init__(self):
+        super().__init__("NATIVE_INPUT_EXPIRED")
+
+
+class _NativeInputCell:
+    def __init__(self, owner):
+        self.owner = weakref.ref(owner)
+        self.lock = RLock()
+        self.epoch = 0
+        self.revoked = False
+
+    def revoke(self):
+        with self.lock:
+            self.revoked = True
+
+
+@dataclass(frozen=True)
+class NativeInputStamp:
+    _cell: _NativeInputCell
+    _epoch: int
+
+
+_NATIVE_INPUT: ContextVar[_NativeInputCell | None] = ContextVar("native_input_lifetime", default=None)
+
+
+def _native_input_task():
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _clear_native_input() -> None:
+    cell = _NATIVE_INPUT.get()
+    _NATIVE_INPUT.set(None)
+    task = _native_input_task()
+    if isinstance(cell, _NativeInputCell) and task is not None and cell.owner() is task:
+        cell.revoke()
+
+
+def begin_native_input() -> None:
+    """Start before native capture; detaching a child's inherited cell never revokes its parent."""
+    _clear_native_input()
+    task = _native_input_task()
+    if task is None or task.done() or task.cancelling():
+        raise NativeInputExpired()
+    cell = _NativeInputCell(task)
+    _NATIVE_INPUT.set(cell)
+    task.add_done_callback(lambda _task, owned=cell: owned.revoke())
+
+
+def snapshot_native_input() -> NativeInputStamp:
+    cell = _NATIVE_INPUT.get()
+    if not isinstance(cell, _NativeInputCell):
+        raise NativeInputExpired()
+    with cell.lock:
+        stamp = NativeInputStamp(cell, cell.epoch)
+        validate_native_input(stamp)
+        return stamp
+
+
+@contextmanager
+def native_input_guard(stamp: NativeInputStamp) -> Iterator[None]:
+    """Linearize a frozen-stamp check and bounded local mutation; never hold across network awaits."""
+    if not isinstance(stamp, NativeInputStamp) or _NATIVE_INPUT.get() is not stamp._cell:
+        raise NativeInputExpired()
+    cell = stamp._cell
+    with cell.lock:
+        owner = cell.owner()
+        if (cell.revoked or cell.epoch != stamp._epoch or owner is None
+                or owner.done() or owner.cancelling()):
+            raise NativeInputExpired()
+        yield
+
+
+def validate_native_input(stamp: NativeInputStamp) -> None:
+    with native_input_guard(stamp):
+        pass
+
+
+def advance_native_input() -> bool:
+    """Revoke old stamps BEFORE consuming new model input. Absence preserves non-gateway agents."""
+    cell = _NATIVE_INPUT.get()
+    if cell is None:
+        return False
+    if not isinstance(cell, _NativeInputCell):
+        raise NativeInputExpired()
+    with cell.lock:
+        cell.epoch += 1
+    return True
+
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
 _UNSET: Any = object()
@@ -129,6 +228,7 @@ def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared (``""``, not ``_UNSET``), so
     ``get_session_env`` returns empty instead of stale ``os.environ`` values.  Async-delivery
     goes back to ``_UNSET``: a cleared context is default-supported, not opted-out."""
+    _clear_native_input()
     for var in _SESSION_VARS:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
@@ -140,6 +240,7 @@ def reset_session_vars() -> None:
     the top of a fresh task *before* it binds: ``create_task`` snapshots the context, so B's
     task inherits A's already-set vars and a subprocess spawned before B binds would read A's
     identity.  ``_SESSION_ASYNC_DELIVERY`` (outside ``_VAR_MAP``) is reset explicitly too."""
+    _clear_native_input()
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)

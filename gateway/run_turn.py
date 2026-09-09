@@ -3437,6 +3437,8 @@ class GatewayTurnMixin:
         if not result.get("interrupted"):
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
+        from gateway.session_context import advance_native_input
+        advance_native_input()
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
