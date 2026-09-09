@@ -53,5 +53,11 @@ The subsequent Creative F1 busy-completion fixture reached the actual adapter pe
 
 `tests/gateway/test_queue_consumption.py` reproduces the premature recursive dequeue (RED1failed/5passed). After correction, queue-consumption, pending-drain-race, goal-continuation-drain and session-env tests pass23/23. The actual native `completion_queued_behind` test now verifies the internal event was queued during live ordinary work, ordinary output precedes the selected image, exact original admission survives, and a structurally valid new produce attempt in the completion is denied without a second provider request. This added runtime delta requires new exact-head independent review and CI; the prior5e9d approval does not cover it. No installed runtime or scope/permission change is claimed.
 
+## Review correction: preserve FIFO across cold handoff
+
+Independent review of `298322b16ee38882f1ac9c6e72f96a28ddd46cd5` reproduced ordinary -> internal -> newer-C -> older-B: cold adapter dispatch empties the pending slot while older human work remains in overflow. A new arrival previously occupied that empty slot ahead of acknowledged work. Retain cold internal dispatch; correct the existing `_enqueue_fifo` primitive so an empty slot first receives the oldest overflow entry, with the new arrival appended behind remaining overflow. No second queue, new scheduler, or changed input authority.
+
+The reviewer adapter-lifecycle reproduction is now a portable regression in `test_goal_continuation_drain.py`, with the real enqueue/promotion/drain/adapter flow and no real provider. Before correction it fails with the exact reversed order (1failed/2passed); after correction, the five targeted queue/goal/persistence files pass35tests, including expected ordinary -> internal -> older-B -> newer-C. Ruff and diff checks pass. Existing workflow already includes these files. This successor needs fresh exact-head independent review and CI; neither prior verdict approves it. Source was developed in a separate isolated worktree to avoid mutating the prior frozen native qualification run.
+
 ## Not claimed
 No generic inverse session-key parser, raw text-only watcher migration, shutdown routing redesign, new supervisor, arbitrary cold shared-transport recovery, runtime self-install or Creative pixel/fleet acceptance from fixture results.
