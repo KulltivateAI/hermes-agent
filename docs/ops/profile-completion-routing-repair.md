@@ -47,5 +47,11 @@ Regression: `bash scripts/run_tests.sh tests/gateway/test_session_env.py tests/g
 
 Done when exact-head author-distinct approval and applicable CI pass, the corrected runtime is installed through the supported release path, and Creative's named-profile delivery is verified. This session/auth-sensitive correction is in Drew's explicitly requested Creative launch scope. It remains subject to the high-risk human gate and must not self-restart an active shared gateway. No broader engineering-process redesign is part of this repair.
 
+## Queued completion must start a native turn
+
+The subsequent Creative F1 busy-completion fixture reached the actual adapter pending slot while an unrelated ordinary turn was active. The runtime then consumed the internal completion recursively, advanced the native input epoch, and reused the old route lease without cold capture; reconciliation failed with `TRUSTED_TURN_REQUIRED`. Preserve the internal `MessageEvent` in the existing adapter slot so normal next-turn dispatch performs fresh route capture and original-operation proof. Do not grant fresh user intake to an internal completion. Ordinary human queue recursion remains unchanged.
+
+`tests/gateway/test_queue_consumption.py` reproduces the premature recursive dequeue (RED1failed/5passed). After correction, queue-consumption, pending-drain-race, goal-continuation-drain and session-env tests pass23/23. The actual native `completion_queued_behind` test now verifies the internal event was queued during live ordinary work, ordinary output precedes the selected image, exact original admission survives, and a structurally valid new produce attempt in the completion is denied without a second provider request. This added runtime delta requires new exact-head independent review and CI; the prior5e9d approval does not cover it. No installed runtime or scope/permission change is claimed.
+
 ## Not claimed
 No generic inverse session-key parser, raw text-only watcher migration, shutdown routing redesign, new supervisor, arbitrary cold shared-transport recovery, runtime self-install or Creative pixel/fleet acceptance from fixture results.
