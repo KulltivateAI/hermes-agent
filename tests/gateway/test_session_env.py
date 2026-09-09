@@ -76,6 +76,24 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+@pytest.mark.parametrize("session_id", ["conversation-a", "conversation-b", ""])
+def test_gateway_rebinds_session_id_without_reconstructing_agent(monkeypatch, session_id):
+    """Cached-agent turns must bind identity before any background tool runs."""
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="100", user_id="200")
+    context = SessionContext(source=source, connected_platforms=[], home_channels={},
+                             session_key="agent:main:discord:dm:100", session_id=session_id)
+    monkeypatch.setenv("HERMES_SESSION_ID", "foreign-process-id")
+    for _ in range(2):
+        tokens = runner._set_session_env(context)
+        try:
+            assert get_session_env("HERMES_SESSION_ID") == session_id
+            assert os.environ["HERMES_SESSION_ID"] == "foreign-process-id"
+        finally:
+            runner._clear_session_env(tokens)
+        assert get_session_env("HERMES_SESSION_ID") == ""
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)

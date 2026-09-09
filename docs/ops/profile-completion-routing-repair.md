@@ -37,5 +37,15 @@ The native Creative tests subsequently proved explicit `/queue` recursion and su
 
 This is an additional high-risk input/session authorization change. The prior8dff0fb approval and green CI do NOT approve these new bytes. Fresh author-distinct exact-head review, green hosted CI, human high-risk signoff and supported external installation remain required. No runtime self-install, new supervisor or unattended activation is introduced. External IO admitted before replacement cannot be retroactively rolled back; the epoch lock is never held over a network await.
 
+## Cached-conversation background identity repair
+
+Creative's two-distinct-operation native fixture reproduced a second waiter with correct nonce/owner/route but empty `parent_session_id`. `_set_session_env` omitted the resolved `SessionContext.session_id`; constructing a fresh agent masked that omission, while a reused agent did not rebind the empty ContextVar. The second native acknowledgement consequently remained manual and automatic reconciliation returned only the first result.
+
+Bind `session_id=context.session_id` through the existing task-local `set_session_vars` call. No environment write, new identity primitive, snapshot relaxation, alternate delivery path or permission change. The field already exists in the context built from the authoritative session entry. Missing context identity remains explicitly empty; foreign ambient IDs must not substitute. Repeated cached turns must keep their exact identity and cleanup must still clear it.
+
+Regression: `bash scripts/run_tests.sh tests/gateway/test_session_env.py tests/gateway/test_session_context_inheritance.py tests/gateway/test_background_process_notifications.py -q`. Before correction the new known-session cases fail (2 failed/10 passed); after correction all37 tests across3 files pass. Existing runtime-reliability CI already includes these files; no workflow change. Platform native `two_distinct_operations` went RED (one missing operation) then GREEN with this single production line, using real native admission, both actual background waiters, batch/reconcile and distinct image/caption delivery. External model/HTTP/Discord sinks are synthetic; this is not live-provider proof.
+
+Done when exact-head author-distinct approval and applicable CI pass, the corrected runtime is installed through the supported release path, and Creative's named-profile delivery is verified. This session/auth-sensitive correction is in Drew's explicitly requested Creative launch scope. It remains subject to the high-risk human gate and must not self-restart an active shared gateway. No broader engineering-process redesign is part of this repair.
+
 ## Not claimed
 No generic inverse session-key parser, raw text-only watcher migration, shutdown routing redesign, new supervisor, arbitrary cold shared-transport recovery, runtime self-install or Creative pixel/fleet acceptance from fixture results.
