@@ -703,12 +703,18 @@ def _run_agent_tool_execution_middleware(
     dispatch_lock = threading.Lock()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace)
 
-    block_message, block_error_type = scope_block, "tool_scope_block"
-    if block_message is None:
-        block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
-        block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
-        state.args = ref.args
+    resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
+    plugin_block, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
+    state.args = ref.args
+
+    # Scope/schema enforcement is computed from the original deferred call and
+    # remains denial-dominant: a plugin mutation cannot rewrite an unauthorized
+    # call into an authorized one. Plugin denials are already bounded/redacted by
+    # the pre_tool_call dispatcher and apply when scope itself allows the call.
+    if scope_block is not None:
+        block_message, block_error_type = scope_block, "tool_scope_block"
+    else:
+        block_message, block_error_type = plugin_block, "plugin_block"
 
     def _authorized_dispatch(
         final_args: dict[str, Any],
