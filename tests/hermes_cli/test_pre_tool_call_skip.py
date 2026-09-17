@@ -147,6 +147,28 @@ def test_skip_gates_direct_tool_call_after_deferred_unwrap(monkeypatch):
     assert "deferred access denied" in result
 
 
+def test_invalid_direct_tool_call_invokes_pre_tool_once(monkeypatch):
+    """A bridge validation error still traverses one canonical policy callback."""
+    seen_names = []
+
+    def allow(**kwargs):
+        seen_names.append(kwargs["tool_name"])
+
+    manager = PluginManager()
+    manager._discovered = True
+    manager._hooks["pre_tool_call"] = [allow]
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    with patch(
+        "model_tools._dispatch_bridge_tool",
+        return_value=('{"error":"invalid deferred call"}', None),
+    ):
+        result = handle_function_call("tool_call", {"name": "missing", "arguments": {}})
+
+    assert "invalid deferred call" in result
+    assert seen_names == ["tool_call"]
+
+
 def test_non_denied_mutation_and_execution_are_unchanged(monkeypatch):
     manager = PluginManager()
     manager._discovered = True

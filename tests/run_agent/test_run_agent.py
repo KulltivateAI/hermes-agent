@@ -2162,6 +2162,65 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_invoke_tool_pre_tool_skip_stops_before_request_middleware(self, agent, monkeypatch):
+        calls = {"pre": 0, "request": 0, "dispatch": 0}
+
+        def pre_tool(*_args, **_kwargs):
+            calls["pre"] += 1
+            return "direct route denied", None
+
+        def request_middleware(*_args, **_kwargs):
+            calls["request"] += 1
+            raise AssertionError("denied call reached request middleware")
+
+        def dispatch(*_args, **_kwargs):
+            calls["dispatch"] += 1
+            raise AssertionError("denied call reached registry route")
+
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_tool)
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", request_middleware)
+        with patch("model_tools.handle_function_call", side_effect=dispatch):
+            result = agent._invoke_tool("web_search", {"query": "original"}, "task-1")
+
+        assert json.loads(result) == {"error": "direct route denied"}
+        assert calls == {"pre": 1, "request": 0, "dispatch": 0}
+
+    def test_invoke_tool_pre_mutation_precedes_request_and_execution_middleware(self, agent, monkeypatch):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        order = []
+
+        def pre_tool(_name, args, **_kwargs):
+            order.append(("pre", dict(args)))
+            return None, {**args, "pre": True}
+
+        def request_middleware(_name, args, **_kwargs):
+            order.append(("request", dict(args)))
+            payload = {**args, "request": True}
+            return RequestMiddlewareResult(payload=payload, original_payload=args, changed=True, trace=[])
+
+        def execution_middleware(_name, args, callback, **_kwargs):
+            order.append(("execution", dict(args)))
+            return callback({**args, "execution": True})
+
+        def dispatch(_name, args, *_args, **_kwargs):
+            order.append(("dispatch", dict(args)))
+            return "result"
+
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_tool)
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", request_middleware)
+        monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", execution_middleware)
+        with patch("model_tools.handle_function_call", side_effect=dispatch):
+            result = agent._invoke_tool("web_search", {"query": "original"}, "task-1")
+
+        assert result == "result"
+        assert order == [
+            ("pre", {"query": "original"}),
+            ("request", {"query": "original", "pre": True}),
+            ("execution", {"query": "original", "pre": True, "request": True}),
+            ("dispatch", {"query": "original", "pre": True, "request": True, "execution": True}),
+        ]
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
