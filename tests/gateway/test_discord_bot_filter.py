@@ -3,9 +3,10 @@
 import os
 import re
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
+import pytest
 
 from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -168,6 +169,36 @@ class TestDiscordBotFilter(unittest.TestCase):
         """Default behavior (no env var) should be 'none'."""
         default = os.getenv("DISCORD_ALLOW_BOTS", "none")
         self.assertEqual(default, "none")
+
+
+@pytest.mark.asyncio
+async def test_hook_mentions_refusal_precedes_discord_side_effects():
+    our_user = _make_author(is_self=True)
+    bot = _make_author(bot=True)
+    message = _make_message(
+        author=bot, content=f"<@{our_user.id}> signed request", mentions=[our_user],
+    )
+    original_content = message.content
+    adapter = object.__new__(DiscordAdapter)
+    adapter._client = MagicMock(user=our_user)
+    adapter._voice_text_channels = {}
+    adapter._get_parent_channel_id = MagicMock(return_value=None)
+    adapter._discord_channel_keys = MagicMock(return_value={"222"})
+    adapter._get_allowed_channels = MagicMock(return_value=set())
+    adapter._get_ignored_channels = MagicMock(return_value=set())
+    adapter._discord_free_response_channels = MagicMock(return_value=set())
+    adapter._discord_require_mention = MagicMock(return_value=True)
+    adapter._in_bot_thread = MagicMock(return_value=False)
+    adapter._pre_admit_hook_mentions_bot = MagicMock(return_value=(True, None))
+    adapter._auto_create_thread = AsyncMock()
+    adapter._collect_attachment_media = AsyncMock()
+    adapter._fetch_channel_context = AsyncMock()
+
+    assert await adapter._handle_message(message) is False
+    assert message.content == original_content
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter._collect_attachment_media.assert_not_awaited()
+    adapter._fetch_channel_context.assert_not_awaited()
 
 
 if __name__ == "__main__":

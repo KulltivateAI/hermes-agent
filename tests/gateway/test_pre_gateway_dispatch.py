@@ -211,3 +211,21 @@ async def test_hook_mentions_denies_when_hook_invocation_raises(monkeypatch):
     runner = _make_hook_gate_runner()
 
     assert await runner._hm_admit_event(_make_discord_bot_event()) is None
+
+
+@pytest.mark.asyncio
+async def test_busy_session_runs_hook_before_authorization_or_queue_side_effects(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_a, **_kw: [{"action": "skip", "reason": "invalid signature"}],
+    )
+    runner = _make_hook_gate_runner()
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+
+    handled = await runner._handle_active_session_busy_message(
+        _make_discord_bot_event(), "agent:main:discord:group:654321",
+    )
+
+    assert handled is True
+    runner._is_user_authorized_for_source.assert_not_called()

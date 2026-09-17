@@ -1432,6 +1432,37 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False
         return await self._handle_message(message, role_authorized=role_authorized)
 
+    def _pre_admit_hook_mentions_bot(
+        self, message: Any, text: str, *, thread_id: Optional[str], parent_channel_id: Optional[str],
+    ) -> tuple[bool, Optional[MessageEvent]]:
+        """Evaluate hook-gated bot input before Discord-visible or network side effects.
+
+        Returns ``(required, event)``; ``(True, None)`` is a fail-closed refusal.
+        """
+        if not getattr(message.author, "bot", False) or self._get_allow_bots() != "hook_mentions":
+            return False, None
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return True, None
+        channel = message.channel
+        is_dm = isinstance(channel, discord.DMChannel)
+        guild = getattr(message, "guild", None)
+        source = self.build_source(
+            chat_id=str(channel.id), chat_name=getattr(channel, "name", None),
+            chat_type="dm" if is_dm else ("thread" if thread_id else "group"),
+            user_id=str(message.author.id), user_name=message.author.display_name,
+            thread_id=thread_id, is_bot=True, guild_id=str(guild.id) if guild else None,
+            parent_chat_id=parent_channel_id, message_id=str(message.id),
+        )
+        event = MessageEvent(
+            text=text, message_type=MessageType.TEXT, source=source, raw_message=message,
+            message_id=str(message.id), timestamp=message.created_at,
+        )
+        admitted = runner._hm_pre_gateway_dispatch_hook(event, source)
+        if admitted is None or not admitted._plugin_authorized:
+            return True, None
+        return True, admitted
+
     # --- gateway_platform_event fire-sites ---
 
     def _thread_id_and_chat_for_channel(self, channel) -> tuple[Optional[str], Optional[str]]:
@@ -5673,7 +5704,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
-            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -5703,6 +5733,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
+        # hook_mentions is a gateway policy gate, not merely an adapter relevance filter. Evaluate
+        # it before mutating the SDK message, creating a thread, downloading attachments, or reading
+        # history. Timeout/error/non-authorize therefore leaves Discord untouched.
+        try:
+            _early_required, _early_admission = self._pre_admit_hook_mentions_bot(
+                message, normalized_content, thread_id=thread_id, parent_channel_id=parent_channel_id,
+            )
+        except Exception as exc:
+            logger.warning("[%s] hook_mentions pre-admission failed closed: %s", self.name, exc)
+            return False
+        if _early_required and _early_admission is None:
+            return False
+        if _early_admission is not None:
+            normalized_content = _early_admission.text
+        if mention_prefix:
+            message.content = normalized_content
+
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
@@ -5794,7 +5841,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # and prepend it. DMs skipped (every DM triggers the bot); in-flight arrivals not captured.
         _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm and self._discord_history_backfill():
+        if (
+            not _is_dm
+            and not getattr(_early_admission, "_plugin_clear_channel_context", False)
+            and self._discord_history_backfill()
+        ):
             # Backfill on a gap: mention-gated channels, any thread (processing/restart gaps), any
             # reply (hydrate context around the referenced message). DMs/fresh auto-threads: nothing.
             _has_mention_gap = require_mention and not is_free_channel and not in_bot_thread
@@ -5835,6 +5886,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        if _early_admission is not None:
+            event._plugin_hook_ran = True
+            event._plugin_authorized = True
         # Track participation so follow-ups in this thread don't need @mention.
         if thread_id:
             self._threads.mark(thread_id)
