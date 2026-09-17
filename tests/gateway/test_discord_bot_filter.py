@@ -5,6 +5,10 @@ import re
 import unittest
 from unittest.mock import MagicMock
 
+import discord
+
+from plugins.platforms.discord.adapter import DiscordAdapter
+
 
 def _make_author(*, bot: bool = False, is_self: bool = False):
     """Create a mock Discord author."""
@@ -23,8 +27,9 @@ def _make_message(*, author=None, content="hello", mentions=None, is_dm=False):
     msg.content = content
     msg.attachments = []
     msg.mentions = mentions or []
+    msg.id = 777
+    msg.type = discord.MessageType.default
     if is_dm:
-        import discord
         msg.channel = MagicMock(spec=discord.DMChannel)
         msg.channel.id = 111
     else:
@@ -93,6 +98,16 @@ class TestDiscordBotFilter(unittest.TestCase):
         
         return True  # message accepted
 
+    @staticmethod
+    def _run_real_admission(message, allow_bots, client_user):
+        adapter = object.__new__(DiscordAdapter)
+        adapter._client = MagicMock(user=client_user)
+        adapter._dedup = MagicMock()
+        adapter._dedup.contains.return_value = False
+        adapter._get_allow_bots = lambda: allow_bots
+        adapter._discord_bots_require_inline_mention = lambda: False
+        return adapter._discord_message_admission(message, claim=False)[0]
+
     def test_own_messages_always_ignored(self):
         """Bot's own messages are always ignored regardless of allow_bots."""
         bot_user = _make_author(is_self=True)
@@ -134,6 +149,19 @@ class TestDiscordBotFilter(unittest.TestCase):
                 bots_require_inline_mention=True,
             )
         )
+
+    def test_hook_mentions_requires_literal_raw_self_mention(self):
+        our_user = _make_author(is_self=True)
+        bot = _make_author(bot=True)
+        reply_ping_only = _make_message(author=bot, mentions=[our_user])
+        literal_mention = _make_message(
+            author=bot,
+            content=f"<@{our_user.id}> signed request",
+            mentions=[our_user],
+        )
+
+        self.assertFalse(self._run_real_admission(reply_ping_only, "hook_mentions", our_user))
+        self.assertTrue(self._run_real_admission(literal_mention, "hook_mentions", our_user))
 
 
     def test_default_is_none(self):

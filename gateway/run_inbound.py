@@ -43,7 +43,11 @@ class GatewayInboundMixin:
     ) -> Optional["MessageEvent"]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
+        ``authorize`` → authorize only this event; ``allow``/None → normal dispatch. Runs BEFORE auth."""
+        # Never trust a marker carried by a reused event or set by callback mutation. Only a valid
+        # directive observed below creates the one-event authorization receipt.
+        event._plugin_authorized = False
+        _plugin_authorized = False
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _hook_results = _invoke_hook(
@@ -71,8 +75,24 @@ class GatewayInboundMixin:
                 if isinstance(_new_text, str):
                     event = dataclasses.replace(event, text=_new_text)
                 break
+            if _action == "authorize":
+                _new_text = _result.get("text")
+                _clear_context = _result.get("clear_channel_context", False)
+                if ("text" in _result and not isinstance(_new_text, str)) or not isinstance(_clear_context, bool):
+                    logger.warning("Ignoring malformed pre_gateway_dispatch authorize directive")
+                    break
+                _changes = {}
+                if "text" in _result:
+                    _changes["text"] = _new_text
+                if _clear_context:
+                    _changes["channel_context"] = None
+                if _changes:
+                    event = dataclasses.replace(event, **_changes)
+                _plugin_authorized = True
+                break
             if _action == "allow":
                 break
+        event._plugin_authorized = _plugin_authorized
         return event
 
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
@@ -183,7 +203,9 @@ class GatewayInboundMixin:
             return None
         source = event.source
 
-        if not self._is_user_authorized_for_source(source):
+        if not self._is_user_authorized_for_source(
+            source, plugin_authorized=event._plugin_authorized,
+        ):
             if source.user_id is None:
                 # No user identity (Telegram service messages, channel forwards, anonymous admin
                 # posts, sender_chat): can't be paired but may be authorized via a chat allowlist.
