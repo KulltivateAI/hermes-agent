@@ -2291,6 +2291,172 @@ class TestConcurrentToolExecution:
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
 
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_pre_tool_skip_precedes_all_execution_middleware(
+        self, agent, monkeypatch, concurrent,
+    ):
+        """A plugin veto fires once and prevents Relay/middleware side effects."""
+        from agent import relay_tools
+        from hermes_cli import plugins
+        from hermes_cli.plugins import PluginManager
+
+        effects = {
+            "pre_tool": 0,
+            "relay": 0,
+            "middleware": 0,
+            "tool_start": 0,
+            "checkpoint": 0,
+        }
+
+        def skip(**_kwargs):
+            effects["pre_tool"] += 1
+            return {"action": "skip", "reason": "denied before middleware"}
+
+        def short_circuit(**_kwargs):
+            effects["middleware"] += 1
+            return "middleware-short-circuit-side-effect"
+
+        manager = PluginManager()
+        manager._discovered = True
+        manager._hooks["pre_tool_call"] = [skip]
+        manager._middleware["tool_execution"] = [short_circuit]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent.tool_start_callback = lambda *_args: effects.__setitem__(
+            "tool_start", effects["tool_start"] + 1,
+        )
+        agent._checkpoint_mgr.enabled = True
+        agent._checkpoint_mgr.ensure_checkpoint = lambda *_args: effects.__setitem__(
+            "checkpoint", effects["checkpoint"] + 1,
+        )
+
+        original_relay_execute = relay_tools.execute
+
+        def relay_execute(*args, **kwargs):
+            effects["relay"] += 1
+            return original_relay_execute(*args, **kwargs)
+
+        monkeypatch.setattr(relay_tools, "execute", relay_execute)
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"denied.txt","content":"must-not-write"}',
+            call_id="c-denied",
+        )
+        messages = []
+        with patch(
+            "model_tools.handle_function_call",
+            side_effect=AssertionError("denied tool body must not execute"),
+        ):
+            if concurrent:
+                agent._execute_tool_calls_concurrent(
+                    _mock_assistant_msg(content="", tool_calls=[tool_call]), messages, "task-1",
+                )
+            else:
+                agent._execute_tool_calls_sequential(
+                    _mock_assistant_msg(content="", tool_calls=[tool_call]), messages, "task-1",
+                )
+
+        assert effects == {
+            "pre_tool": 1,
+            "relay": 0,
+            "middleware": 0,
+            "tool_start": 0,
+            "checkpoint": 0,
+        }
+        assert json.loads(messages[0]["content"]) == {
+            "error": "Tool call skipped by pre_tool_call policy: denied before middleware",
+        }
+
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_non_denied_middleware_short_circuit_is_unchanged(
+        self, agent, monkeypatch, concurrent,
+    ):
+        """Moving policy ahead does not force short-circuit middleware to dispatch."""
+        from hermes_cli import plugins
+        from hermes_cli.plugins import PluginManager
+
+        calls = {"pre_tool": 0, "middleware": 0}
+
+        def allow(**_kwargs):
+            calls["pre_tool"] += 1
+
+        def short_circuit(**_kwargs):
+            calls["middleware"] += 1
+            return "middleware-short-circuit-side-effect"
+
+        manager = PluginManager()
+        manager._discovered = True
+        manager._hooks["pre_tool_call"] = [allow]
+        manager._middleware["tool_execution"] = [short_circuit]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+        tool_call = _mock_tool_call(
+            name="terminal", arguments='{"command":"must-not-run"}', call_id="c-short",
+        )
+        messages = []
+        with patch(
+            "model_tools.handle_function_call",
+            side_effect=AssertionError("short-circuit middleware must not dispatch"),
+        ):
+            executor = (
+                agent._execute_tool_calls_concurrent
+                if concurrent
+                else agent._execute_tool_calls_sequential
+            )
+            executor(
+                _mock_assistant_msg(content="", tool_calls=[tool_call]), messages, "task-1",
+            )
+
+        assert calls == {"pre_tool": 1, "middleware": 1}
+        assert messages[0]["content"] == "middleware-short-circuit-side-effect"
+
+    @pytest.mark.parametrize("concurrent", [False, True])
+    def test_pre_tool_mutation_reaches_middleware_and_tool(
+        self, agent, monkeypatch, concurrent,
+    ):
+        """Allowed hook mutations become the input to middleware and dispatch."""
+        from hermes_cli import plugins
+        from hermes_cli.plugins import PluginManager
+
+        middleware_args = []
+
+        def execution_middleware(*, args, next_call, **_kwargs):
+            middleware_args.append(args)
+            return next_call(args)
+
+        manager = PluginManager()
+        manager._discovered = True
+        manager._hooks["pre_tool_call"] = [
+            lambda **_kwargs: {
+                "action": "modify",
+                "args": {"query": "rewritten-before-middleware"},
+            },
+        ]
+        manager._middleware["tool_execution"] = [execution_middleware]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"query":"original"}', call_id="c-modified",
+        )
+        messages = []
+        dispatched = []
+        with patch(
+            "model_tools.handle_function_call",
+            side_effect=lambda _name, args, *_a, **_kw: dispatched.append(args) or "tool-result",
+        ):
+            executor = (
+                agent._execute_tool_calls_concurrent
+                if concurrent
+                else agent._execute_tool_calls_sequential
+            )
+            executor(
+                _mock_assistant_msg(content="", tool_calls=[tool_call]), messages, "task-1",
+            )
+
+        expected = {"query": "rewritten-before-middleware"}
+        assert middleware_args == [expected]
+        assert dispatched == [expected]
+        assert messages[0]["content"] == "tool-result"
+
     def test_concurrent_skip_callbacks_never_reach_tool_bodies(self, agent, monkeypatch):
         """The parallel executor uses the same denial-dominant single-fire hook gate."""
         from hermes_cli import plugins
