@@ -192,10 +192,12 @@ class PluginDispatchMixin:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
 
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
-        what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
-        ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
-        closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
-        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
+        what they declare. Each callback is isolated. Bounded hooks and policy hooks run under
+        ``plugins.hook_callback_timeout`` (worker abandoned, never joined); policy timeouts fail
+        closed with surface-specific directives, while other bounded hooks skip. Exceptions from
+        ``pre_gateway_dispatch`` callbacks also synthesize a denial. ``_HOOK_CALLER_THREAD_HOOKS``
+        always run on the caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a
+        str) to inject.
         """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
@@ -229,6 +231,11 @@ class PluginDispatchMixin:
                     results.append(ret)
             except Exception as exc:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
+                if hook_name == "pre_gateway_dispatch":
+                    results.append({
+                        "action": "skip",
+                        "reason": "pre_gateway_dispatch plugin callback raised an exception",
+                    })
         return results
 
     def _report_hook_failure(

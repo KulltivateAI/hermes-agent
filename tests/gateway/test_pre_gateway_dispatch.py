@@ -200,17 +200,40 @@ async def test_hook_mentions_denies_without_valid_explicit_authorize(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_hook_mentions_denies_when_hook_invocation_raises(monkeypatch):
+@pytest.mark.parametrize(
+    "hook_result",
+    [
+        [
+            {"action": "authorize", "text": "validated request"},
+            {"action": "skip", "reason": "later callback timed out"},
+        ],
+        [
+            {"action": "skip", "reason": "earlier callback timed out"},
+            {"action": "authorize", "text": "validated request"},
+        ],
+    ],
+)
+async def test_hook_mentions_fail_closed_skip_dominates_authorize(monkeypatch, hook_result):
     _clear_auth_env(monkeypatch)
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "hook_mentions")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: hook_result)
+    runner = _make_hook_gate_runner()
+
+    assert await runner._hm_admit_event(_make_discord_bot_event()) is None
+
+
+@pytest.mark.asyncio
+async def test_hook_invocation_exception_fails_closed_for_authorized_traffic(monkeypatch):
+    _clear_auth_env(monkeypatch)
 
     def _raise(*_args, **_kwargs):
         raise TimeoutError("plugin timed out")
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _raise)
-    runner = _make_hook_gate_runner()
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event()
 
-    assert await runner._hm_admit_event(_make_discord_bot_event()) is None
+    assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
 
 
 @pytest.mark.asyncio

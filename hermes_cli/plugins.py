@@ -1699,7 +1699,8 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and policy hooks are
     bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
     joined) so we do not reintroduce the #6622 hang. Timed-out or still-running policy callbacks fail
-    closed with a surface-specific directive; other bounded hooks fail open (skip).
+    closed with a surface-specific directive; ``pre_gateway_dispatch`` callback exceptions also deny
+    the event, while other bounded-hook failures fail open (skip).
     Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
     callbacks registered by user plugins (tracking #64178).
