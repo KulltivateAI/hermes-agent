@@ -37,9 +37,10 @@ jobs:
             exit 0
           fi
 
-          # An email is mapped if it has a file in contributors/emails/
+          # An email is mapped if it has a valid file in contributors/emails/
           # (one file per email — conflict-free) or an entry in the frozen
-          # legacy AUTHOR_MAP in scripts/release.py.
+          # legacy AUTHOR_MAP in scripts/release.py. Invalid directory mappings
+          # fail closed instead of falling through to the legacy map.
           MISSING=""
           while IFS= read -r email; do
             # Skip teknium and bot emails
@@ -53,7 +54,7 @@ jobs:
             fi
 
             # Python casefold keeps this Unicode-safe and aligned with the local
-            # audit. Ambiguous case-colliding mappings return 2 and fail closed.
+            # audit. Invalid or ambiguous mappings return 2 and fail closed.
             mapping_status=0
             if python3 scripts/contributor_email_mapping.py "$email"; then
               continue  # mapped via the contributors directory
@@ -62,7 +63,7 @@ jobs:
             fi
             if [ "$mapping_status" -eq 2 ]; then
               AUTHOR=$(git log --author="$email" --format='%an' -1)
-              MISSING="${MISSING}\n  ${email} (${AUTHOR}; ambiguous mapping)"
+              MISSING="${MISSING}\n  ${email} (${AUTHOR}; invalid or ambiguous mapping)"
               continue
             fi
 
@@ -95,7 +96,7 @@ jobs:
             REVIEW_STATUS=$(jq -nc \
               --arg detail "$DETAIL" \
               --arg how_to_fix "$HOW_TO_FIX" \
-              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
+              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Missing or invalid contributor email mapping(s)","summary":"New contributor email(s) need valid attribution mappings.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
             echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
             echo "review_status=$REVIEW_STATUS" > review-status.json
 

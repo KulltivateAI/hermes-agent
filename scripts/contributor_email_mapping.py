@@ -73,8 +73,8 @@ def main() -> int:
         print(f"usage: {Path(sys.argv[0]).name} <email>", file=sys.stderr)
         return 2
     try:
-        return 0 if find_email_mapping(sys.argv[1]) is not None else 1
-    except AmbiguousEmailMappingError as exc:
+        return 0 if resolve_email_mapping(sys.argv[1], EMAILS_DIR) is not None else 1
+    except (AmbiguousEmailMappingError, InvalidEmailMappingError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

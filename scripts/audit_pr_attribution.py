@@ -33,7 +33,8 @@ from pathlib import Path
 
 from contributor_email_mapping import (
     AmbiguousEmailMappingError,
-    find_email_mapping,
+    InvalidEmailMappingError,
+    resolve_email_mapping,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,9 +73,9 @@ def is_mapped(email: str) -> bool:
     if ID_NOREPLY_RE.search(email):
         return True
     try:
-        if find_email_mapping(email) is not None:
+        if resolve_email_mapping(email, REPO_ROOT / "contributors" / "emails") is not None:
             return True
-    except AmbiguousEmailMappingError as exc:
+    except (AmbiguousEmailMappingError, InvalidEmailMappingError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return False
     release_py = REPO_ROOT / "scripts" / "release.py"
