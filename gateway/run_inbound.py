@@ -58,19 +58,29 @@ class GatewayInboundMixin:
             )
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-            _hook_results = []
+            return None
+
+        # A fail-closed denial from any callback must dominate authorization regardless of callback
+        # order (for example, when a later callback times out after an earlier one authorizes).
+        _skip = next(
+            (
+                result for result in _hook_results
+                if isinstance(result, dict) and result.get("action") == "skip"
+            ),
+            None,
+        )
+        if _skip is not None:
+            logger.info(
+                "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                _skip.get("reason"), source.platform.value if source.platform else "unknown",
+                source.chat_id or "unknown",
+            )
+            return None
 
         for _result in _hook_results:
             if not isinstance(_result, dict):
                 continue
             _action = _result.get("action")
-            if _action == "skip":
-                logger.info(
-                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                    _result.get("reason"), source.platform.value if source.platform else "unknown",
-                    source.chat_id or "unknown",
-                )
-                return None
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):

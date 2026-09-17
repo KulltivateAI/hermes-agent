@@ -1090,6 +1090,28 @@ class TestForceReloadSymmetry:
         }]
         assert elapsed < 1.0
 
+    def test_pre_gateway_dispatch_callback_exception_fails_closed_after_authorize(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
+        )
+
+        def _raise(**_kwargs):
+            raise RuntimeError("broken policy callback")
+
+        mgr = PluginManager()
+        mgr._hooks["pre_gateway_dispatch"] = [
+            lambda **_kw: {"action": "authorize"},
+            _raise,
+        ]
+
+        assert mgr.invoke_hook("pre_gateway_dispatch", event=object()) == [
+            {"action": "authorize"},
+            {
+                "action": "skip",
+                "reason": "pre_gateway_dispatch plugin callback raised an exception",
+            },
+        ]
+
     def test_pre_gateway_dispatch_zero_timeout_cannot_disable_bounding(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0
