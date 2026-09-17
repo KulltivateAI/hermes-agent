@@ -2291,6 +2291,45 @@ class TestConcurrentToolExecution:
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
 
+    def test_concurrent_skip_callbacks_never_reach_tool_bodies(self, agent, monkeypatch):
+        """The parallel executor uses the same denial-dominant single-fire hook gate."""
+        from hermes_cli import plugins
+        from hermes_cli.plugins import PluginManager
+
+        callback_calls = []
+
+        def modify(**kwargs):
+            callback_calls.append(("modify", kwargs["tool_call_id"]))
+            return {"action": "modify", "args": {"query": "rewritten"}}
+
+        def skip(**kwargs):
+            callback_calls.append(("skip", kwargs["tool_call_id"]))
+            return {"action": "skip", "reason": "parallel policy veto"}
+
+        manager = PluginManager()
+        manager._discovered = True
+        manager._hooks["pre_tool_call"] = [modify, skip]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+        tool_calls = [
+            _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1"),
+            _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2"),
+        ]
+        messages = []
+        with patch(
+            "model_tools.handle_function_call",
+            side_effect=AssertionError("skipped parallel tool body must not execute"),
+        ):
+            agent._execute_tool_calls_concurrent(
+                _mock_assistant_msg(content="", tool_calls=tool_calls), messages, "task-1",
+            )
+
+        assert sorted(callback_calls) == [
+            ("modify", "c1"), ("modify", "c2"), ("skip", "c1"), ("skip", "c2"),
+        ]
+        assert len(messages) == 2
+        assert all("parallel policy veto" in message["content"] for message in messages)
+
 
 
 

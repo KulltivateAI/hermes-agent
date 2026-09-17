@@ -681,6 +681,15 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     return None, (underlying_name, underlying_args)
 
 
+def _is_bridge_catalog_read(function_name: str) -> bool:
+    """Whether a bridge call executes inline instead of redispatching an underlying tool."""
+    try:
+        from tools import tool_search as ts
+    except Exception:
+        return False
+    return function_name in {ts.TOOL_SEARCH_NAME, ts.TOOL_DESCRIBE_NAME}
+
+
 def _apply_request_middleware(
     function_name: str, function_args: Dict[str, Any], ids: _CallIds, trace: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
@@ -831,6 +840,15 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
+    # Gate inline reads before dispatch too. Agent-owned routes already fired the
+    # hook and pass skip_pre_tool_call_hook=True, preserving the single-fire contract.
+    if _is_bridge_catalog_read(function_name):
+        function_args, blocked = _pre_dispatch_guards(
+            function_name, function_args, skip_pre_tool_call_hook, ids, trace,
+        )
+        if blocked is not None:
+            result, error_type, error_message = blocked
+            return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
     bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
     if bridged is not None:
         result, underlying = bridged

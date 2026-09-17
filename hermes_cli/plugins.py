@@ -1757,6 +1757,35 @@ class _PreToolCallDirective:
     modified_args: Optional[Dict[str, Any]] = None
 
 
+_PRE_TOOL_CALL_SKIP_REASON_MAX_CHARS = 500
+_PRE_TOOL_CALL_SKIP_DEFAULT_REASON = "Denied by pre_tool_call policy"
+
+
+def _sanitize_pre_tool_call_skip_reason(reason: Any) -> str:
+    """Return a bounded, model-safe denial message without leaking a plugin secret.
+
+    Skip reasons cross a security boundary into model context. Redaction is therefore
+    unconditional; if the shared redactor is unavailable, fail closed to the generic
+    reason instead of exposing the original text.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        sanitized = _PRE_TOOL_CALL_SKIP_DEFAULT_REASON
+    else:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            sanitized = redact_sensitive_text(
+                reason, force=True, redact_url_credentials=True,
+            )
+        except Exception:
+            sanitized = _PRE_TOOL_CALL_SKIP_DEFAULT_REASON
+    sanitized = re.sub(r"[\x00-\x1f\x7f]+", " ", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip() or _PRE_TOOL_CALL_SKIP_DEFAULT_REASON
+    if len(sanitized) > _PRE_TOOL_CALL_SKIP_REASON_MAX_CHARS:
+        sanitized = sanitized[:_PRE_TOOL_CALL_SKIP_REASON_MAX_CHARS - 3] + "..."
+    return f"Tool call skipped by pre_tool_call policy: {sanitized}"
+
+
 def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
@@ -1774,10 +1803,13 @@ def _get_pre_tool_call_directive_details(
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
-    the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
-    human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). First valid directive
-    wins; irrelevant returns are ignored."""
+    """Resolve one ``pre_tool_call`` hook pass into a dispatch directive.
+
+    An explicit ``{"action": "skip", "reason": ...}`` is a hard denial and
+    dominates every modify/block/approve result regardless callback order. Without
+    a skip, legacy first-valid block/approve and argument-mutation behavior is
+    unchanged. Irrelevant returns are ignored.
+    """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
@@ -1788,6 +1820,15 @@ def _get_pre_tool_call_directive_details(
         task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
     )
+    # Security vetoes are denial-dominant. Inspect the complete result snapshot
+    # before resolving any authorization request or applying legacy first-wins
+    # semantics; callbacks have already run exactly once inside invoke_hook.
+    for result in hook_results:
+        if isinstance(result, dict) and result.get("action") == "skip":
+            return _PreToolCallDirective(
+                action="skip",
+                message=_sanitize_pre_tool_call_skip_reason(result.get("reason")),
+            )
     modified_args: Optional[Dict[str, Any]] = None
     for result in hook_results:
         if not isinstance(result, dict):
@@ -1818,7 +1859,7 @@ def _get_pre_tool_call_directive_details(
 def get_pre_tool_call_directive(
     tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
 ) -> tuple[Optional[str], Optional[str]]:
-    """Back-compat: ``(directive, message)`` with directive ``"block"`` / ``"approve"`` / ``None``.
+    """Back-compat tuple with directive ``"skip"`` / ``"block"`` / ``"approve"`` / ``None``.
     ``hook_kwargs`` are the observability ids of :func:`_get_pre_tool_call_directive_details`."""
     details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
     return (details.action, details.message)
@@ -1827,9 +1868,12 @@ def get_pre_tool_call_directive(
 def get_pre_tool_call_block_message(
     tool_name: str, args: Optional[Dict[str, Any]], **hook_kwargs: Any
 ) -> Optional[str]:
-    """Deprecated shim: only the ``block`` message (or ``None``); ``approve`` is invisible here."""
+    """Deprecated shim: hard-denial message (``skip``/``block``), else ``None``.
+
+    ``approve`` remains invisible here for backwards compatibility.
+    """
     directive, message = get_pre_tool_call_directive(tool_name, args, **hook_kwargs)
-    return message if directive == "block" else None
+    return message if directive in ("skip", "block") else None
 
 
 def resolve_pre_tool_block(
@@ -1846,7 +1890,7 @@ def _resolve_block_from_details(
 ) -> Optional[str]:
     """The ONE place for the fail-closed approval logic: ``block`` blocks with its message; an
     ``approve`` whose gate errors, denies, or times out is blocked; anything else proceeds."""
-    if details.action == "block":
+    if details.action in ("skip", "block"):
         return details.message
     if details.action != "approve":
         return None
