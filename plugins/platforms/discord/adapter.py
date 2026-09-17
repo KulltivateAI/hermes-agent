@@ -1438,6 +1438,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 return False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
                 return False, False
+            if allow_bots == "hook_mentions" and not self._self_is_raw_mentioned(message):
+                return False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
@@ -4767,9 +4769,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return self._gate_env("GATEWAY_ALLOW_ALL_USERS").strip().lower() in {"true", "1", "yes"}
 
     def _get_allow_bots(self) -> str:
-        """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
+        """Per-profile DISCORD_ALLOW_BOTS mode."""
         raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
-        return str(raw or "none").lower().strip() or "none"
+        mode = str(raw or "none").lower().strip() or "none"
+        if mode not in {"none", "mentions", "hook_mentions", "all"}:
+            logger.warning("[Discord] Unknown allow_bots=%r; treating as 'none'", raw)
+            return "none"
+        return mode
 
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
@@ -4875,7 +4881,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if limit <= 0:
             return ""
         allow_bots_raw = self._get_allow_bots()
-        include_other_bots = allow_bots_raw != "none"
+        include_other_bots = allow_bots_raw in {"mentions", "all"}
         # Narrow via cached last-self-message id (`after`) only if it predates the trigger; miss => full scan.
         channel_id = str(getattr(channel, "id", ""))
         _cached_id = self._last_self_message_id.get(channel_id)

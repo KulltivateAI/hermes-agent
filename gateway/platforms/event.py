@@ -86,6 +86,8 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Set only from a valid pre_gateway_dispatch ``authorize`` directive for this event.
+    _plugin_authorized: bool = field(default=False, init=False, repr=False, compare=False)
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
