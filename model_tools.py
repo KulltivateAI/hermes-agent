@@ -866,13 +866,12 @@ def handle_function_call(
             # Catalog reads were gated above. A failed direct tool_call cannot
             # resolve an underlying name, so gate the bridge name before
             # returning its validation error and keep the one-callback contract.
+            # The existing scope/schema denial remains dominant over any plugin
+            # block reason or argument mutation.
             if not _is_bridge_catalog_read(function_name):
-                function_args, blocked = _pre_tool_policy(
+                function_args, _ = _pre_tool_policy(
                     function_name, function_args, skip_pre_tool_call_hook, ids, trace,
                 )
-                if blocked is not None:
-                    result, error_type, error_message = blocked
-                    return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
             return _emit(result, duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,

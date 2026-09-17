@@ -190,6 +190,65 @@ class TestHandleFunctionCall:
         assert result == {"error": "denied before request middleware"}
         assert calls == {"pre": 1, "request": 0, "dispatch": 0}
 
+    def _assert_bridge_denial_dominates_plugin(self, monkeypatch, denial):
+        calls = {"pre": 0, "middleware": 0, "tool": 0}
+        original_args = {"name": "deferred_denied", "arguments": {}}
+        modified_args = {"name": "allowed_after_policy", "arguments": {"ok": True}}
+        plugin_denial = "plugin-secret-" + ("x" * 600)
+        scope_message = (
+            "'deferred_denied' is not available in this session. "
+            "Use tool_search to find tools you can call."
+        )
+        schema_error = json.dumps({
+            "error": "Deferred tool arguments failed schema validation; tool was NOT invoked",
+            "parameters": {"type": "object", "required": ["document_id"]},
+            "hint": "Call tool_describe first",
+        })
+        expected = json.dumps({"error": scope_message}) if denial == "scope" else schema_error
+
+        def pre_tool(function_name, function_args, **_kwargs):
+            calls["pre"] += 1
+            assert function_name == "tool_call"
+            assert function_args == original_args
+            return plugin_denial, modified_args
+
+        def middleware(*_args, **_kwargs):
+            calls["middleware"] += 1
+            raise AssertionError("scope/schema denial reached middleware")
+
+        def dispatch(*_args, **_kwargs):
+            calls["tool"] += 1
+            raise AssertionError("scope/schema denial reached registry dispatch")
+
+        monkeypatch.setattr(
+            "tools.tool_search.resolve_underlying_call",
+            lambda _args: ("deferred_denied", {}, None),
+        )
+        monkeypatch.setattr(
+            "tools.tool_search.scoped_deferrable_names",
+            lambda _defs: frozenset() if denial == "scope" else frozenset({"deferred_denied"}),
+        )
+        monkeypatch.setattr(
+            "tools.tool_search.validate_deferred_call_args",
+            lambda _name, _args: schema_error if denial == "schema" else None,
+        )
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_tool)
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", middleware)
+        monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", middleware)
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = handle_function_call("tool_call", original_args)
+
+        assert result == expected
+        assert plugin_denial not in result
+        assert calls == {"pre": 1, "middleware": 0, "tool": 0}
+
+    def test_direct_bridge_scope_denial_dominates_plugin_denial(self, monkeypatch):
+        self._assert_bridge_denial_dominates_plugin(monkeypatch, "scope")
+
+    def test_direct_bridge_schema_denial_dominates_plugin_denial(self, monkeypatch):
+        self._assert_bridge_denial_dominates_plugin(monkeypatch, "schema")
+
     def test_registry_exception_emits_terminal_tool_hook(self, monkeypatch):
         from hermes_cli import lifecycle
 
