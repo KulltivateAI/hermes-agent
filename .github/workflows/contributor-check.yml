@@ -28,7 +28,7 @@ jobs:
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
@@ -52,8 +52,18 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if [ -f "contributors/emails/${email}" ]; then
+            # Python casefold keeps this Unicode-safe and aligned with the local
+            # audit. Ambiguous case-colliding mappings return 2 and fail closed.
+            mapping_status=0
+            if python3 scripts/contributor_email_mapping.py "$email"; then
               continue  # mapped via the contributors directory
+            else
+              mapping_status=$?
+            fi
+            if [ "$mapping_status" -eq 2 ]; then
+              AUTHOR=$(git log --author="$email" --format='%an' -1)
+              MISSING="${MISSING}\n  ${email} (${AUTHOR}; ambiguous mapping)"
+              continue
             fi
 
             if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then

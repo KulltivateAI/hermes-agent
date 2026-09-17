@@ -31,6 +31,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from contributor_email_mapping import (
+    AmbiguousEmailMappingError,
+    find_email_mapping,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SKIP_SUBSTRINGS = (
@@ -66,8 +71,12 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
-        return True
+    try:
+        if find_email_mapping(email) is not None:
+            return True
+    except AmbiguousEmailMappingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return False
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:
         if f'"{email}"' in release_py.read_text(encoding="utf-8", errors="replace"):
