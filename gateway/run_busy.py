@@ -651,11 +651,22 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Busy events bypass GatewayInboundMixin._handle_message at the adapter boundary. Run the
+        # same pre-auth policy hook before any command, queue, interrupt, or acknowledgement side
+        # effect; a queued follow-up carries the receipt so it is not evaluated a second time.
+        if not event.internal and not getattr(event, "_plugin_hook_ran", False):
+            event = self._hm_pre_gateway_dispatch_hook(event, event.source)
+            if event is None:
+                return True
+
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
         from gateway.run import _AGENT_PENDING_SENTINEL
-        # See #17775.
-        if not self._is_user_authorized(event.source):
+        # See #17775. Authorize under the live transport profile and carry the same event-local
+        # admission receipt used by the cold path.
+        if not self._is_user_authorized_for_source(
+            event.source, plugin_authorized=event._plugin_authorized,
+        ):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,

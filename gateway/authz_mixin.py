@@ -419,6 +419,18 @@ class GatewayAuthorizationMixin:
             return set()
         return {s for e in resolved_ids if isinstance(e, (str, int)) and (s := str(e).strip())}
 
+    def _bot_allow_mode(self, source) -> str:
+        allow_bots_var = _ALLOW_BOTS_ENV.get(source.platform)
+        if not allow_bots_var:
+            return "none"
+        scoped = _platform_gate_env(allow_bots_var)
+        if scoped:
+            return scoped.lower().strip()
+        extra = {}
+        with contextlib.suppress(Exception):
+            extra = self._adapter_extra_for_source(source)
+        return str(extra.get("allow_bots") or "none").lower().strip()
+
     def _chat_scoped_grant(self, source, adapter_profile, is_group: bool, allow_adapter_delegation: bool) -> bool:
         """Grants that need no ``user_id`` (checked before the no-user-id guard)."""
         # Trusted-upstream delegation (relay): the connector authenticates this gateway's WS and
@@ -447,8 +459,7 @@ class GatewayAuthorizationMixin:
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (Slack Workflow Builder
         # posts arrive with user=None).
         if getattr(source, "is_bot", False):
-            allow_bots_var = _ALLOW_BOTS_ENV.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            if self._bot_allow_mode(source) in {"mentions", "all"}:
                 return True
         return False
 
@@ -470,10 +481,13 @@ class GatewayAuthorizationMixin:
             self._warned_telegram_group_users_legacy = True
         return source.chat_id in legacy_chat_ids
 
-    def _is_user_authorized(self, source: SessionSource, *, allow_adapter_delegation: bool = True) -> bool:
+    def _is_user_authorized(
+        self, source: SessionSource, *, allow_adapter_delegation: bool = True,
+        plugin_authorized: bool = False,
+    ) -> bool:
         """Whether a user may use the bot.
 
-        Order: trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
+        Order: one-event plugin authorization, trusted-upstream delegation, chat-scoped group allowlists, ``{PLATFORM}_ALLOW_BOTS``,
         per-platform allow-all, adapter role auth, pairing store, env/config allowlists,
         ``GATEWAY_ALLOW_ALL_USERS``, default deny.
         """
@@ -481,6 +495,16 @@ class GatewayAuthorizationMixin:
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
+        if plugin_authorized:
+            return True
+        # hook_mentions is an adapter relevance gate only. It intentionally overrides every
+        # ordinary principal/chat grant for bot traffic unless this event received authorize.
+        if (
+            getattr(source, "is_bot", False)
+            and source.platform == Platform.DISCORD
+            and self._bot_allow_mode(source) == "hook_mentions"
+        ):
+            return False
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES

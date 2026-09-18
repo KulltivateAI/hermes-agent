@@ -51,7 +51,9 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    # The Kulltivate fork has no larger Windows runner label. Preserve the
+    # upstream matrix while using the standard Windows host only in the fork.
+    runs-on: ${{ github.repository == 'KulltivateAI/hermes-agent' && matrix.name == 'Windows-only tests' && 'windows-latest' || matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

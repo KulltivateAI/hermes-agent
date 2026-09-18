@@ -30,6 +30,12 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from contributor_email_mapping import (
+    AmbiguousEmailMappingError,
+    InvalidEmailMappingError,
+    resolve_email_mapping,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
@@ -2233,8 +2239,17 @@ def update_version_files(semver: str, calver_date: str):
 
 def resolve_author(name: str, email: str) -> str:
     """Resolve a git author to a GitHub @mention."""
-    # Try email lookup first
-    gh_user = AUTHOR_MAP.get(email)
+    # Directory mappings take precedence and match commit emails by casefold.
+    try:
+        gh_user = resolve_email_mapping(email, CONTRIBUTORS_EMAILS_DIR)
+    except (AmbiguousEmailMappingError, InvalidEmailMappingError):
+        return name
+    if gh_user:
+        return f"@{gh_user}"
+
+    # Keep the frozen legacy map exact: it contains casefold duplicates whose
+    # safety cannot be inferred from historical data.
+    gh_user = LEGACY_AUTHOR_MAP.get(email)
     if gh_user:
         return f"@{gh_user}"
 
