@@ -681,6 +681,15 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     return None, (underlying_name, underlying_args)
 
 
+def _is_bridge_catalog_read(function_name: str) -> bool:
+    """Whether a bridge call executes inline instead of redispatching an underlying tool."""
+    try:
+        from tools import tool_search as ts
+    except Exception:
+        return False
+    return function_name in {ts.TOOL_SEARCH_NAME, ts.TOOL_DESCRIBE_NAME}
+
+
 def _apply_request_middleware(
     function_name: str, function_args: Dict[str, Any], ids: _CallIds, trace: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
@@ -694,10 +703,10 @@ def _apply_request_middleware(
         return function_args, dict(function_args), trace
 
 
-def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
-                         ids: _CallIds, middleware_trace: List[Dict[str, Any]],
-                         ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
-    """Plugin pre_tool_call hook, then ACP edit approval.
+def _pre_tool_policy(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
+                     ids: _CallIds, middleware_trace: List[Dict[str, Any]],
+                     ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
+    """Run the plugin pre-tool policy exactly once, before request middleware.
 
     ``(args, None)`` to proceed (args possibly plugin-modified), or
     ``(args, (result, error_type, error_message))`` when blocked.
@@ -717,6 +726,12 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             logger.debug("pre_tool_call hook error: %s", _hook_err)
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
+    return function_args, None
+
+
+def _approval_guard(function_name: str, function_args: Dict[str, Any],
+                    ) -> Optional[Tuple[Any, str, Optional[str]]]:
+    """Apply legacy ACP edit approval after allowed request rewrites, before dispatch."""
 
     # ACP/Zed edit approval before any file mutation. The requester is bound
     # via ContextVar only for ACP sessions, so CLI/gateway paths are unaffected.
@@ -724,12 +739,12 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         from acp_adapter.edit_approval import maybe_require_edit_approval
         edit_block_message = maybe_require_edit_approval(function_name, function_args)
         if edit_block_message is not None:
-            return function_args, (edit_block_message, "edit_approval_denied", None)
+            return edit_block_message, "edit_approval_denied", None
     except Exception as _edit_approval_err:
         logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
         if function_name in {"write_file", "patch"}:
-            return function_args, (tool_error("Edit approval denied: approval guard failed"), "edit_approval_error", None)
-    return function_args, None
+            return tool_error("Edit approval denied: approval guard failed"), "edit_approval_error", None
+    return None
 
 
 @contextmanager
@@ -831,10 +846,32 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
+    # Gate inline reads before dispatch too. Agent-owned routes already fired the
+    # hook and pass skip_pre_tool_call_hook=True, preserving the single-fire contract.
+    if _is_bridge_catalog_read(function_name):
+        function_args, blocked = _pre_tool_policy(
+            function_name, function_args, skip_pre_tool_call_hook, ids, trace,
+        )
+        if blocked is not None:
+            result, error_type, error_message = blocked
+            return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
+        approval_block = _approval_guard(function_name, function_args)
+        if approval_block is not None:
+            result, error_type, error_message = approval_block
+            return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
     bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:
+            # Catalog reads were gated above. A failed direct tool_call cannot
+            # resolve an underlying name, so gate the bridge name before
+            # returning its validation error and keep the one-callback contract.
+            # The existing scope/schema denial remains dominant over any plugin
+            # block reason or argument mutation.
+            if not _is_bridge_catalog_read(function_name):
+                function_args, _ = _pre_tool_policy(
+                    function_name, function_args, skip_pre_tool_call_hook, ids, trace,
+                )
             return _emit(result, duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
@@ -842,6 +879,13 @@ def handle_function_call(
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         )
+
+    function_args, blocked = _pre_tool_policy(
+        function_name, function_args, skip_pre_tool_call_hook, ids, trace,
+    )
+    if blocked is not None:
+        result, error_type, error_message = blocked
+        return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
 
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
@@ -851,9 +895,9 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        function_args, blocked = _pre_dispatch_guards(function_name, function_args, skip_pre_tool_call_hook, ids, trace)
-        if blocked is not None:
-            result, error_type, error_message = blocked
+        approval_block = _approval_guard(function_name, function_args)
+        if approval_block is not None:
+            result, error_type, error_message = approval_block
             return _emit(result, status="blocked", error_type=error_type, error_message=error_message)
 
         # Any non-read/search tool resets the consecutive-read-loop counter.

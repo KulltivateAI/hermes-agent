@@ -2200,14 +2200,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
-    try:
-        from hermes_cli.middleware import apply_tool_request_middleware
-        if not skip_tool_request_middleware:
-            _tool_request_mw = apply_tool_request_middleware(function_name, function_args, **hook_ids)
-            function_args = _tool_request_mw.payload
-            _tool_middleware_trace = _tool_request_mw.trace
-    except Exception as _mw_err:
-        logger.debug("tool_request middleware error: %s", _mw_err)
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         block_message, function_args = _pre_tool_block_message(
@@ -2222,6 +2214,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             middleware_trace=_tool_middleware_trace,
         )
         return result
+    try:
+        from hermes_cli.middleware import apply_tool_request_middleware
+        if not skip_tool_request_middleware:
+            _tool_request_mw = apply_tool_request_middleware(function_name, function_args, **hook_ids)
+            function_args = _tool_request_mw.payload
+            _tool_middleware_trace = _tool_request_mw.trace
+    except Exception as _mw_err:
+        logger.debug("tool_request middleware error: %s", _mw_err)
     tool_start_time = time.monotonic()
     inline_executor = resolve_invoke_tool_executor(agent, function_name)
     if inline_executor is not None:

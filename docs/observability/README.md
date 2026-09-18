@@ -55,12 +55,20 @@ behavior-affecting hooks:
 | Hook | Return behavior |
 | --- | --- |
 | `pre_llm_call` | May return a string or `{"context": "..."}` to inject ephemeral context into the current user message. |
-| `pre_tool_call` | May return `{"action": "block", "message": "..."}` to block a tool before execution, or `{"action": "modify", "args": {...}}` to transform the tool's input arguments. |
+| `pre_tool_call` | May return `{"action": "skip", "reason": "..."}` for a hard denial, `{"action": "block", "message": "..."}` for the legacy block behavior, or `{"action": "modify", "args": {...}}` to transform tool arguments. |
 | `transform_tool_result` | May return a replacement tool result string after `post_tool_call`. |
 | `transform_llm_output` | May return a replacement final assistant text string. |
 
 Telemetry plugins should treat these behavior-affecting returns as optional
 compatibility features, not as observability requirements.
+
+`pre_tool_call` callbacks are all invoked once. If any callback returns the
+explicit `{"action": "skip"}` directive, that denial wins regardless of callback
+order and no tool body or approval prompt runs. Its optional `reason` is
+unconditionally secret-redacted, normalized, and capped before the deterministic
+denial result enters model context; an absent or unusable reason gets a generic
+policy-denial message. Legacy callbacks remain fail-open on errors, and existing
+`block`, `approve`, and `modify` ordering is unchanged when no `skip` is present.
 
 ## Correlation IDs
 
