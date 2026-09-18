@@ -54,7 +54,9 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
+    # The Kulltivate fork has no larger-runner labels; upstream keeps its
+    # optimized runner while fork CI uses the standard hosted pool.
+    runs-on: ${{ github.repository == 'KulltivateAI/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code

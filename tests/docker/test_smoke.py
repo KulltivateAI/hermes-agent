@@ -12,7 +12,13 @@ here is skipped at collection time.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+
+
+# Native runners retain the long-standing bounds. The Kulltivate fork can
+# raise them explicitly for an arm64 image running under x64 QEMU.
+_DOCKER_RUN_TIMEOUT = int(os.environ.get("HERMES_DOCKER_RUN_TIMEOUT", "60"))
 
 
 def test_hermes_help(built_image: str) -> None:
@@ -27,7 +33,7 @@ def test_hermes_help(built_image: str) -> None:
     """
     r = subprocess.run(
         ["docker", "run", "--rm", built_image, "--help"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=_DOCKER_RUN_TIMEOUT,
     )
     assert r.returncode == 0, (
         f"hermes --help failed (exit {r.returncode}): "
@@ -48,7 +54,7 @@ def test_dashboard_subcommand_present(built_image: str) -> None:
     """
     r = subprocess.run(
         ["docker", "run", "--rm", built_image, "dashboard", "--help"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=_DOCKER_RUN_TIMEOUT,
     )
     assert r.returncode == 0, (
         f"hermes dashboard --help failed (exit {r.returncode}): "
@@ -72,7 +78,7 @@ def test_hermes_help_under_wrapped_init(built_image: str) -> None:
     """
     r = subprocess.run(
         ["docker", "run", "--init", "--rm", built_image, "--help"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=max(120, _DOCKER_RUN_TIMEOUT),
     )
     assert "can only run as pid 1" not in (r.stdout + r.stderr), (
         f"s6-overlay-suexec aborted under a wrapped init (#38349): "
