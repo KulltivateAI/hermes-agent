@@ -301,7 +301,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
-| `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. |
+| `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls messages from other Discord bots. `"none"` ignores them. `"mentions"` accepts messages that mention Hermes and authorizes every matching bot. `"hook_mentions"` forwards only a literal/raw self-mention to `pre_gateway_dispatch` but grants no authorization; a trusted plugin must return an explicit valid `authorize` directive. `"all"` accepts all bot messages. Unknown values fail closed as `"none"`. |
 | `DISCORD_REACTIONS` | No | `true` | When `true`, the bot adds emoji reactions to messages during processing (👀 when starting, ✅ on success, ❌ on error). Set to `false` to disable reactions entirely. |
 | `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
 | `DISCORD_ALLOWED_CHANNELS` | No | — | Comma-separated channel IDs. When set, the bot **only** responds in these channels (plus DMs if allowed). Overrides `config.yaml` `discord.allowed_channels`. Combine with `DISCORD_IGNORED_CHANNELS` to express allow/deny rules. |
@@ -320,7 +320,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | No | `2.0` | Delay between split chunks when a single message exceeds Discord's length limit. |
 
 :::warning Bot-to-bot conversation is not supported
-`DISCORD_ALLOW_BOTS` exists to accept input from a specific trusted bot (e.g. a relay or webhook bot), not to let two Hermes profiles talk to each other. The default, `"none"`, ignores all other bots and is the safe setting.
+`DISCORD_ALLOW_BOTS` exists to accept machine input, not to let two Hermes profiles talk to each other. The default, `"none"`, ignores all other bots. For validated machine requests, use `"hook_mentions"` with a trusted [`pre_gateway_dispatch`](../features/hooks.md#pre_gateway_dispatch) plugin. A raw `<@BOT_ID>`/`<@!BOT_ID>` token only makes the message relevant enough to reach the hook; it never authorizes the sender. Missing plugins, exceptions/timeouts, `None`, `allow`, `rewrite`, and malformed `authorize` results are denied. The plugin should validate `event.raw_message`, reject attachments it does not explicitly support, and return `{"action": "authorize", "text": "...", "clear_channel_context": true}` only after validation.
 
 Wiring multiple Hermes profiles to reply to one another in a shared channel — by setting `"mentions"` or `"all"` across several profiles — is an unsupported topology. Discord auto-`@mentions` the replied-to author on every reply, so under `"mentions"` two bots will satisfy each other's mention gate indefinitely and ack-loop. There is no circuit breaker for this because the supported configuration is simply to leave `DISCORD_ALLOW_BOTS` at `"none"`. If you must accept a particular bot, scope the acceptance narrowly and never to another auto-replying agent.
 :::
@@ -332,6 +332,7 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 ```yaml
 # Discord-specific settings
 discord:
+  allow_bots: none                # none | mentions | hook_mentions | all
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)

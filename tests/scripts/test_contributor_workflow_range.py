@@ -35,6 +35,9 @@ def history(tmp_path):
     (repo / 'contributors/emails/mapped@example.invalid').write_text('fixture\n')
     (repo / 'scripts').mkdir()
     (repo / 'scripts/release.py').write_text('LEGACY_AUTHOR_MAP = {}\n')
+    (repo / 'scripts/contributor_email_mapping.py').write_text(
+        (ROOT / 'scripts/contributor_email_mapping.py').read_text()
+    )
     return repo, base, head
 
 

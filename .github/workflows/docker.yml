@@ -70,7 +70,7 @@ jobs:
   # protected publish job after these tests pass.
   build:
     needs: [detect]
-    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true'
+    if: (github.repository == 'NousResearch/hermes-agent' || github.repository == 'KulltivateAI/hermes-agent') && needs.detect.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -88,14 +88,23 @@ jobs:
             cache-from: type=gha,scope=docker-arm64
             cache-to: type=gha,mode=max,scope=docker-arm64
 
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    runs-on: ${{ github.repository == 'KulltivateAI/hermes-agent' && 'ubuntu-latest' || matrix.runner }}
+    timeout-minutes: ${{ github.repository == 'KulltivateAI/hermes-agent' && 60 || 45 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Reject profile exports in the build context
         run: python3 scripts/ci/check_profile_archive_boundary.py
+
+      # Upstream's arm64 leg is native. The Kulltivate fork falls back to the
+      # standard x64 hosted pool, so register binfmt before Buildx builds and
+      # runs the arm64 image there.
+      - name: Set up QEMU for fork arm64 build
+        if: github.repository == 'KulltivateAI/hermes-agent' && matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
 
       # Retry once on transient Docker Hub / buildkit pull failures
       # (connection reset, auth token timeout, rate limiting). The action
@@ -174,11 +183,17 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
         run: |
-          # Each of these tests drives a container, so the docker daemon sets
-          # the limit and not the processor. This caps the workers. The
-          # default from run_tests.sh is cpu_count*2, which starts 64
-          # containers together on the 32-core amd64 runner.
-          HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/ --file-timeout 600
+          # Each test file drives containers. Keep upstream and native runners
+          # unchanged. On the fork's x64 QEMU fallback, a four-container fanout
+          # starves every arm64 boot past its 30s readiness bound; prove the
+          # built arm64 image boots with the canonical smoke test while the
+          # fork's amd64 leg retains the complete Docker integration suite.
+          if [ "${{ github.repository }}" = "KulltivateAI/hermes-agent" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
+            HERMES_DOCKER_RUN_TIMEOUT=180 HERMES_TEST_WORKERS=1 \
+              scripts/run_tests.sh tests/docker/test_smoke.py --file-timeout 600
+          else
+            HERMES_TEST_WORKERS=$(nproc) scripts/run_tests.sh tests/docker/ --file-timeout 600
+          fi
 
   # ---------------------------------------------------------------------------
   # Rebuild and push each architecture only after the unprivileged build/test
@@ -203,7 +218,7 @@ jobs:
             platform: linux/arm64
             cache-from: type=gha,scope=docker-arm64
             cache-to: type=gha,mode=max,scope=docker-arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.repository == 'KulltivateAI/hermes-agent' && 'ubuntu-latest' || matrix.runner }}
     timeout-minutes: 30
     steps:
       - name: Checkout trusted source

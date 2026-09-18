@@ -447,7 +447,7 @@ class TestHandleFunctionCallIntegration:
         monkeypatch.setattr(
             lifecycle,
             "invoke_hook",
-            lambda name, **kwargs: events.append((name, kwargs)),
+            lambda name, **kwargs: events.append((name, kwargs)) or [],
         )
         monkeypatch.setattr(
             tool_search,
@@ -466,9 +466,8 @@ class TestHandleFunctionCallIntegration:
         )
 
         assert json.loads(result) == {"results": []}
-        assert len(events) == 1
-        hook_name, payload = events[0]
-        assert hook_name == "post_tool_call"
+        assert [name for name, _payload in events] == ["pre_tool_call", "post_tool_call"]
+        payload = events[-1][1]
         assert payload["status"] == "ok"
         assert payload["turn_id"] == "private-turn"
         assert payload["api_request_id"] == "private-request"

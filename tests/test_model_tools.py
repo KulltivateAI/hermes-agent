@@ -98,9 +98,11 @@ class TestHandleFunctionCall:
 
     def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
         seen = {}
+        order = []
 
         def fake_invoke_middleware(kind, **kwargs):
             if kind == "tool_request":
+                order.append(("request", dict(kwargs["args"])))
                 return [{
                     "args": {**kwargs["args"], "rewritten": True},
                     "source": "test-middleware",
@@ -109,10 +111,12 @@ class TestHandleFunctionCall:
             return []
 
         def execution_middleware(**kwargs):
+            order.append(("execution", dict(kwargs["args"])))
             seen["execution_args"] = kwargs["args"]
             return kwargs["next_call"]({**kwargs["args"], "wrapped": True})
 
         def fake_dispatch(tool_name, args, **kwargs):
+            order.append(("dispatch", dict(args)))
             seen["dispatch"] = (tool_name, args, kwargs)
             return json.dumps({"ok": True, "args": args})
 
@@ -124,10 +128,14 @@ class TestHandleFunctionCall:
         monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", fake_invoke_middleware)
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
-        monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
-        )
+        def invoke_hook(hook_name, **kwargs):
+            hook_calls.append((hook_name, kwargs))
+            if hook_name == "pre_tool_call":
+                order.append(("pre", dict(kwargs["args"])))
+                return [{"action": "modify", "args": {**kwargs["args"], "pre": True}}]
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
@@ -141,14 +149,105 @@ class TestHandleFunctionCall:
             )
         )
 
-        assert seen["execution_args"] == {"q": "test", "rewritten": True}
-        assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
-        assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
+        assert seen["execution_args"] == {"q": "test", "pre": True, "rewritten": True}
+        assert seen["dispatch"][1] == {"q": "test", "pre": True, "rewritten": True, "wrapped": True}
+        assert result["args"] == {"q": "test", "pre": True, "rewritten": True, "wrapped": True}
+        assert order == [
+            ("pre", {"q": "test"}),
+            ("request", {"q": "test", "pre": True}),
+            ("execution", {"q": "test", "pre": True, "rewritten": True}),
+            ("dispatch", {"q": "test", "pre": True, "rewritten": True, "wrapped": True}),
+        ]
         expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]
         pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert pre_call[1]["middleware_trace"] == expected_trace
+        assert pre_call[1]["middleware_trace"] == []
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_pre_tool_skip_stops_before_request_middleware(self, monkeypatch):
+        calls = {"pre": 0, "request": 0, "dispatch": 0}
+
+        def pre_tool(function_name, function_args, **_kwargs):
+            calls["pre"] += 1
+            assert function_name == "web_search"
+            assert function_args == {"query": "original"}
+            return "denied before request middleware", function_args
+
+        def request_middleware(*_args, **_kwargs):
+            calls["request"] += 1
+            raise AssertionError("denied call reached request middleware")
+
+        def dispatch(*_args, **_kwargs):
+            calls["dispatch"] += 1
+            raise AssertionError("denied call reached registry dispatch")
+
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_tool)
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", request_middleware)
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = json.loads(handle_function_call("web_search", {"query": "original"}))
+
+        assert result == {"error": "denied before request middleware"}
+        assert calls == {"pre": 1, "request": 0, "dispatch": 0}
+
+    def _assert_bridge_denial_dominates_plugin(self, monkeypatch, denial):
+        calls = {"pre": 0, "middleware": 0, "tool": 0}
+        original_args = {"name": "deferred_denied", "arguments": {}}
+        modified_args = {"name": "allowed_after_policy", "arguments": {"ok": True}}
+        plugin_denial = "plugin-secret-" + ("x" * 600)
+        scope_message = (
+            "'deferred_denied' is not available in this session. "
+            "Use tool_search to find tools you can call."
+        )
+        schema_error = json.dumps({
+            "error": "Deferred tool arguments failed schema validation; tool was NOT invoked",
+            "parameters": {"type": "object", "required": ["document_id"]},
+            "hint": "Call tool_describe first",
+        })
+        expected = json.dumps({"error": scope_message}) if denial == "scope" else schema_error
+
+        def pre_tool(function_name, function_args, **_kwargs):
+            calls["pre"] += 1
+            assert function_name == "tool_call"
+            assert function_args == original_args
+            return plugin_denial, modified_args
+
+        def middleware(*_args, **_kwargs):
+            calls["middleware"] += 1
+            raise AssertionError("scope/schema denial reached middleware")
+
+        def dispatch(*_args, **_kwargs):
+            calls["tool"] += 1
+            raise AssertionError("scope/schema denial reached registry dispatch")
+
+        monkeypatch.setattr(
+            "tools.tool_search.resolve_underlying_call",
+            lambda _args: ("deferred_denied", {}, None),
+        )
+        monkeypatch.setattr(
+            "tools.tool_search.scoped_deferrable_names",
+            lambda _defs: frozenset() if denial == "scope" else frozenset({"deferred_denied"}),
+        )
+        monkeypatch.setattr(
+            "tools.tool_search.validate_deferred_call_args",
+            lambda _name, _args: schema_error if denial == "schema" else None,
+        )
+        monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", pre_tool)
+        monkeypatch.setattr("hermes_cli.middleware.apply_tool_request_middleware", middleware)
+        monkeypatch.setattr("hermes_cli.middleware.run_tool_execution_middleware", middleware)
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = handle_function_call("tool_call", original_args)
+
+        assert result == expected
+        assert plugin_denial not in result
+        assert calls == {"pre": 1, "middleware": 0, "tool": 0}
+
+    def test_direct_bridge_scope_denial_dominates_plugin_denial(self, monkeypatch):
+        self._assert_bridge_denial_dominates_plugin(monkeypatch, "scope")
+
+    def test_direct_bridge_schema_denial_dominates_plugin_denial(self, monkeypatch):
+        self._assert_bridge_denial_dominates_plugin(monkeypatch, "schema")
 
     def test_registry_exception_emits_terminal_tool_hook(self, monkeypatch):
         from hermes_cli import lifecycle
@@ -310,7 +409,7 @@ class TestPreToolCallBlocking:
         assert result == {"ok": True}
 
 
-    def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
+    def test_pre_tool_policy_precedes_relay_rewrite(self, monkeypatch):
         observed = {}
 
         def rewrite(**kwargs):
@@ -341,7 +440,7 @@ class TestPreToolCallBlocking:
             session_id="s1",
         )
 
-        assert observed["pre_tool_args"]["path"] == "approved.txt"
+        assert observed["pre_tool_args"]["path"] == "original.txt"
         assert observed["dispatch_args"]["path"] == "approved.txt"
 
 

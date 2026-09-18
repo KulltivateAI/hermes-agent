@@ -14,6 +14,8 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
+    # The Kulltivate fork has no larger-runner labels; upstream keeps its
+    # optimized runner while fork CI uses the standard hosted pool.
     runs-on: ${{ github.repository == 'KulltivateAI/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
     timeout-minutes: 30
     steps:
@@ -80,4 +82,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository == 'KulltivateAI/hermes-agent' && '--concurrency 2' || '' }}
+        # The standard four-core fork runner can starve React timer-driven
+        # tests when four workspace processes each fan out internally. Keep
+        # upstream's tuned default, but serialize fork workspaces so test
+        # deadlines measure product behavior rather than host contention.
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository == 'KulltivateAI/hermes-agent' && '--concurrency 1' || '' }}

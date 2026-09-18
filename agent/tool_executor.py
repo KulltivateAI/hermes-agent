@@ -636,14 +636,15 @@ def _dispatch_authorized_once(
     ref: _ToolCallRef,
     *,
     execute,
-    scope_block: str | None,
+    block_message: str | None,
+    block_error_type: str,
     display_index: int | None,
     begin_execution,
-    authorization_gate: _ConcurrentToolAuthorizationGate | None,
 ) -> Any:
-    """Hermes policy (scope → plugin pre-hooks → guardrails) then the one real dispatch.
+    """Apply remaining guardrails, lifecycle preflight, then the one real dispatch.
 
-    Plugin ``modify`` hooks may rewrite ``ref.args`` (mirrored into ``state.args``).
+    Scope and plugin policy have already run before execution middleware. Plugin
+    ``modify`` hooks therefore rewrite ``ref.args`` before this function is reached.
     ``begin_execution`` (concurrent start-order gate) is advanced exactly once on every
     path so later-ordered workers keep moving; blocked calls advance it without a callback.
     """
@@ -652,13 +653,6 @@ def _dispatch_authorized_once(
             begin_execution(callback)
         elif callback is not None:
             callback()
-
-    block_message, block_error_type = scope_block, "tool_scope_block"
-    if block_message is None:
-        block_error_type = "plugin_block"
-        resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
-        block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
-        state.args = ref.args
 
     guardrail_decision = None
     if block_message is None:
@@ -697,7 +691,7 @@ def _run_agent_tool_execution_middleware(
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Run pre-tool policy before Relay/middleware, then dispatch at most once."""
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -707,8 +701,27 @@ def _run_agent_tool_execution_middleware(
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
     dispatch_lock = threading.Lock()
+    ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace)
 
-    def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
+    resolve = lambda: _pre_tool_block(agent, ref)  # noqa: E731
+    plugin_block, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
+    state.args = ref.args
+
+    # Scope/schema enforcement is computed from the original deferred call and
+    # remains denial-dominant: a plugin mutation cannot rewrite an unauthorized
+    # call into an authorized one. Plugin denials are already bounded/redacted by
+    # the pre_tool_call dispatcher and apply when scope itself allows the call.
+    if scope_block is not None:
+        block_message, block_error_type = scope_block, "tool_scope_block"
+    else:
+        block_message, block_error_type = plugin_block, "plugin_block"
+
+    def _authorized_dispatch(
+        final_args: dict[str, Any],
+        *,
+        pre_middleware_block: str | None = None,
+        pre_middleware_error_type: str = "plugin_block",
+    ) -> Any:
         with dispatch_lock:
             if state.dispatched:
                 raise RuntimeError("Hermes tool execution callback invoked more than once")
@@ -720,11 +733,21 @@ def _run_agent_tool_execution_middleware(
             state,
             _ToolCallRef(function_name, final_args, effective_task_id, tool_call_id, trace),
             execute=execute,
-            scope_block=scope_block,
+            block_message=pre_middleware_block,
+            block_error_type=pre_middleware_error_type,
             display_index=display_index,
             begin_execution=begin_execution,
-            authorization_gate=authorization_gate,
         )
+
+    # A policy denial is terminal before Relay or either execution middleware
+    # can rewrite, short-circuit, or perform any side effect.
+    if block_message is not None:
+        state.result = _authorized_dispatch(
+            ref.args,
+            pre_middleware_block=block_message,
+            pre_middleware_error_type=block_error_type,
+        )
+        return state
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
@@ -746,7 +769,7 @@ def _run_agent_tool_execution_middleware(
 
     state.result, _relay_args = relay_tools.execute(
         function_name,
-        function_args,
+        ref.args,
         _hermes_pipeline,
         session_id=str(getattr(agent, "session_id", "") or ""),
         tool_call_id=tool_call_id or None,
