@@ -77,6 +77,13 @@ class MessageEvent:
     # so untrusted payload text stays conversational. Kept last for positional compat.
     allow_gateway_control: bool = True
 
+    # Set only from a valid pre_gateway_dispatch ``authorize`` directive for this event.
+    _plugin_authorized: bool = field(default=False, init=False, repr=False, compare=False)
+    # Process-local receipt that the policy hook already evaluated this event (busy/adapter preflight).
+    _plugin_hook_ran: bool = field(default=False, init=False, repr=False, compare=False)
+    # ``authorize(clear_channel_context=True)`` must also suppress Discord's later history fetch.
+    _plugin_clear_channel_context: bool = field(default=False, init=False, repr=False, compare=False)
+
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.allow_gateway_control and (self.text or "").lstrip().startswith("/")

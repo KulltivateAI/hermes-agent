@@ -251,7 +251,7 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
-def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch():
+def test_sequential_policy_precedes_relay_then_approval_checkpoint_and_dispatch():
     agent = _make_agent("write_file")
     original_args = {"path": "/original/path", "content": "old"}
     final_args = {"path": "/approved/path", "content": "new"}
@@ -318,7 +318,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         agent._execute_tool_calls_sequential(msg, messages, "task-1")
 
     expected = [("write_file", final_args)]
-    assert observed["plugin"] == expected
+    assert observed["plugin"] == [("write_file", original_args)]
     assert observed["guardrail"] == expected
     assert observed["approval"] == expected
     assert observed["start"] == expected
