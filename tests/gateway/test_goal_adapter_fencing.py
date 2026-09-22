@@ -136,6 +136,36 @@ async def test_rejected_direct_goal_is_not_delivered_or_persisted_as_user(env, m
     assert not reply and not rows and not store.clear_resume_pending.await_count
 
 
+@pytest.mark.asyncio
+async def test_failed_agent_result_marks_processing_lifecycle_failed(env):
+    runner, source, _adapter, _mgr, event = env
+    entry = NS(session_id='session', session_key='key')
+    prepared = runner._PreparedTurn([], '', event.text, None, None, None)
+    failed = {'failed': True, 'error': 'HTTP 429: rate limit exceeded', 'messages': []}
+
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, 'key'))
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(prepared, None))
+    runner.hooks = NS(emit=AsyncMock())
+    runner._run_agent = AsyncMock(return_value=failed)
+    runner._hmwa_stop_typing_for_turn = AsyncMock()
+    runner._is_session_run_current = lambda *a: True
+    runner._hmwa_shape_agent_response = AsyncMock(return_value=('Retry later', False, []))
+    runner._hmwa_prepend_reasoning = lambda result, response, *args: response
+    runner._hmwa_runtime_footer_line = lambda *a: ''
+    runner._hmwa_post_turn_hooks = AsyncMock()
+    runner._hmwa_compression_exhaustion_reset = AsyncMock(
+        side_effect=lambda result, response, current_entry, *a: (response, current_entry)
+    )
+    runner._hmwa_persist_turn_transcript = AsyncMock()
+    runner._hmwa_deliver_turn_response = AsyncMock(return_value='Retry later')
+    runner._clear_session_env = lambda *a: None
+
+    reply = await runner._handle_message_with_agent(event, source, 'key', 1)
+
+    assert reply == 'Retry later'
+    assert event._hermes_turn_failed is True
+
+
 def recursive_setup(env):
     runner, source, adapter, mgr, event = env
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock(side_effect=lambda **kw: kw['event'].text)

@@ -3968,7 +3968,9 @@ class BasePlatformAdapter(ABC):
                 event=event) or "")
             await self._run_processing_hook(
                 "on_processing_complete", event,
-                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
+                ProcessingOutcome.SUCCESS
+                if processing_ok and not getattr(event, "_hermes_turn_failed", False)
+                else ProcessingOutcome.FAILURE)
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)

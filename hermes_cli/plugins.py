@@ -1682,6 +1682,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
+def invoke_hook_checked(hook_name: str, **kwargs: Any) -> Tuple[List[Any], bool]:
+    """Invoke hooks and report whether every callback completed successfully."""
+    return _delivery_manager().invoke_hook_checked(hook_name, **kwargs)
+
+
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:
     """Render plugin prompt sections after idempotent plugin discovery."""
     return _ensure_plugins_discovered().render_system_prompt_sections(session_info)

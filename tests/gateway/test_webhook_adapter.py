@@ -19,6 +19,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import socket
 import time
 from collections import deque
@@ -761,6 +762,20 @@ class TestWebhookSilenceSuppression:
 
 
 class TestDeliveryCleanup:
+
+    @pytest.mark.asyncio
+    async def test_log_delivery_never_persists_agent_response_content(self, caplog):
+        adapter = _make_adapter()
+        chat_id = "webhook:private:d-secret"
+        adapter._delivery_info[chat_id] = {"deliver": "log", "deliver_extra": {}}
+        secret = "claim-token-that-must-not-reach-logs"
+
+        with caplog.at_level(logging.INFO, logger="gateway.platforms.webhook"):
+            result = await adapter.send(chat_id, f"processed {secret}")
+
+        assert result.success is True
+        assert secret not in caplog.text
+        assert "content redacted" in caplog.text
 
     @pytest.mark.asyncio
     async def test_delivery_info_survives_multiple_sends(self):

@@ -175,6 +175,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
         # Idempotency: TTL cache of recently processed delivery IDs.
         self._seen_deliveries: Dict[str, float] = {}
+        self._finalized_sessions: Dict[str, float] = {}
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
         self._rate_counts: Dict[str, Deque[float]] = {}  # per-route hit timestamps in a fixed window
@@ -253,7 +254,9 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            # `log` is an autonomous sink, not a human destination. Model output
+            # can contain short-lived capabilities copied from the trusted prompt.
+            logger.info("[webhook] Response for %s completed (%d chars; content redacted)", chat_id, len(content))
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
@@ -283,6 +286,8 @@ class WebhookAdapter(BasePlatformAdapter):
         cutoff = now - self._idempotency_ttl
         for k in [k for k, t in self._seen_deliveries.items() if t < cutoff]:
             self._seen_deliveries.pop(k, None)
+        for k in [k for k, t in self._finalized_sessions.items() if t < cutoff]:
+            self._finalized_sessions.pop(k, None)
         self._seen_deliveries_next_prune_at = now + min(60.0, max(1.0, self._idempotency_ttl / 10))
 
     def _record_rate_limit_hit(self, route_name: str, now: float) -> bool:
@@ -590,23 +595,52 @@ class WebhookAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: "MessageEvent", outcome: Any) -> None:
         """Close the one-shot per-delivery session: ``prune_sessions`` only reaps rows with ``ended_at`` set, so
         unclosed webhook sessions leak unbounded. Fires at the true end of the run; ``end_session()`` is
-        first-reason-wins."""
-        await self._end_webhook_session(event, event.source.chat_id)
+        first-reason-wins. The lifecycle hook runs for success, failure, and cancellation so trusted
+        plugins can fence and finalize durable work even when the model turn raises."""
+        session_id = await self._end_webhook_session(event, event.source.chat_id)
+        if not session_id:
+            return
+        outcome_name = str(getattr(outcome, "value", outcome) or "").lower()
+        if session_id in self._finalized_sessions:
+            return
+        self._finalized_sessions[session_id] = time.time()
+        try:
+            from hermes_cli.lifecycle import invoke_hook_checked as _invoke_hook_checked
+            scope_fn = getattr(self.gateway_runner, "_profile_scope_for_source", None)
+            profile_scope: Any = scope_fn(event.source) if callable(scope_fn) else nullcontext()
+            with profile_scope:
+                _, complete = _invoke_hook_checked(
+                    "on_session_end",
+                    session_id=session_id,
+                    completed=outcome_name == "success",
+                    interrupted=outcome_name == "cancelled",
+                    reason="webhook_complete",
+                    platform="webhook",
+                    outcome=outcome_name,
+                )
+            if not complete:
+                self._finalized_sessions.pop(session_id, None)
+                logger.warning("[webhook] on_session_end lifecycle incomplete for %s; retry remains eligible", session_id)
+        except Exception:
+            self._finalized_sessions.pop(session_id, None)
+            logger.warning("[webhook] on_session_end lifecycle hook failed for %s", session_id, exc_info=True)
 
-    async def _end_webhook_session(self, event: "MessageEvent", session_chat_id: str) -> None:
+    async def _end_webhook_session(self, event: "MessageEvent", session_chat_id: str) -> Optional[str]:
         """Mark the per-delivery session ended via ``SessionDB.end_session`` (never a hand-written UPDATE),
         resolving session_id from the SAME source the run was keyed on."""
         runner = self.gateway_runner
         session_db, store = getattr(runner, "_session_db", None), getattr(runner, "session_store", None)
         key_fn = getattr(runner, "_session_key_for_source", None)
         if runner is None or session_db is None or store is None or key_fn is None:
-            return
+            return None
+        session_id: Optional[str] = None
         try:
             session_key = key_fn(event.source)
-            session_id = _peek_session_id(store, session_key)
+            raw_session_id = _peek_session_id(store, session_key)
+            session_id = str(raw_session_id) if raw_session_id else None
             if not session_id:
                 logger.debug("[webhook] No session_id to close for %s (key=%s)", session_chat_id, session_key)
-                return
+                return None
             # AsyncSessionDB forwards end_session via to_thread; plain SessionDB is sync.
             result = session_db.end_session(session_id, "webhook_complete")
             if asyncio.iscoroutine(result):
@@ -614,6 +648,7 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.debug("[webhook] Closed session %s for delivery %s", session_id, session_chat_id)
         except Exception as e:
             logger.debug("[webhook] Failed to close session for %s: %s", session_chat_id, e)
+        return session_id
 
     # --- Signature validation ---
 
