@@ -21,6 +21,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
+from gateway.log_safety import inbound_message_preview
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
@@ -1918,9 +1919,9 @@ class GatewayTurnMixin:
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", (event.text or "")[:80].replace("\n", " "),
+            source.chat_id or "unknown", inbound_message_preview(_platform_name, event.text),
             getattr(event, "reply_to_message_id", None),
-            (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
+            inbound_message_preview(_platform_name, getattr(event, "reply_to_text", None)),
         )
 
         resolved = await self._hmwa_resolve_session(event, source)
@@ -1988,6 +1989,11 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
+            if agent_failed_early or hidden_reasoning_incomplete:
+                # The adapter may successfully deliver the sanitized failure
+                # response; that must not turn a failed model run into a
+                # successful processing outcome.
+                event._hermes_turn_failed = True
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
@@ -2004,6 +2010,10 @@ class GatewayTurnMixin:
             )
 
         except Exception as e:
+            # The adapter may successfully deliver the sanitized error reply;
+            # that does not make the model turn successful. Preserve the failure
+            # on the event so the processing lifecycle can finalize honestly.
+            event._hermes_turn_failed = True
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state

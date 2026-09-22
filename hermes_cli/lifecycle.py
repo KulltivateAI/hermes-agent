@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, List
+from typing import Any, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
     _observe(hook_name, **kwargs)
     return _plugin_hooks(hook_name, **kwargs)
+
+
+def invoke_hook_checked(hook_name: str, **kwargs: Any) -> Tuple[List[Any], bool]:
+    """Notify observers, then report whether every plugin callback completed."""
+    _observe(hook_name, **kwargs)
+    from hermes_cli import plugins
+    return plugins.invoke_hook_checked(hook_name, **kwargs)
 
 
 def has_hook(hook_name: str) -> bool:

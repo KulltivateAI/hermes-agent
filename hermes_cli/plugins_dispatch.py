@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
 
@@ -177,12 +177,22 @@ class PluginDispatchMixin:
         always run on the caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a
         str) to inject.
         """
+        return self.invoke_hook_checked(hook_name, **kwargs)[0]
+
+    def invoke_hook_checked(self, hook_name: str, **kwargs: Any) -> Tuple[List[Any], bool]:
+        """Invoke hooks and report whether every registered callback completed.
+
+        Ordinary delivery remains isolated and fail-open through ``invoke_hook``.
+        Trusted lifecycle owners use this checked form so a swallowed callback
+        exception or timeout cannot be mistaken for durable finalization.
+        """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
         # unrelated adapter payloads into one monolithic compatibility contract.
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         results: List[Any] = []
+        complete = True
         timeout = _resolve_hook_callback_timeout()
         # This authorization boundary must remain bounded even when the general plugin timeout
         # worker is disabled with zero. A hung admission callback may not wedge gateway intake.
@@ -195,6 +205,7 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
+                        complete = False
                         if fail_closed:  # policy hooks return their surface's fail-closed directive
                             if hook_name == "pre_gateway_dispatch":
                                 results.append({
@@ -207,7 +218,8 @@ class PluginDispatchMixin:
                     ret = self._invoke_hook_callback(cb, kwargs)
                 if ret is not None:
                     results.append(ret)
-            except Exception as exc:
+            except BaseException as exc:
+                complete = False
                 logger.warning(
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
                 if hook_name == "pre_gateway_dispatch":
@@ -215,7 +227,9 @@ class PluginDispatchMixin:
                         "action": "skip",
                         "reason": "pre_gateway_dispatch plugin callback raised an exception",
                     })
-        return results
+                elif fail_closed:
+                    results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
+        return results, complete
 
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
@@ -241,7 +255,7 @@ class PluginDispatchMixin:
         context = contextvars.copy_context()
         done = threading.Event()
         outcome: Dict[str, Any] = {}
-        failure: Dict[str, Exception] = {}
+        failure: Dict[str, BaseException] = {}
 
         def _release_token() -> None:
             with self._hook_timeout_lock:
@@ -251,7 +265,7 @@ class PluginDispatchMixin:
         def _runner() -> None:
             try:
                 outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
-            except Exception as exc:
+            except BaseException as exc:
                 failure["exc"] = exc
             finally:
                 _release_token()
