@@ -27,7 +27,7 @@ import asyncio
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 from gateway.session import SessionSource, SessionStore
 
@@ -95,7 +95,7 @@ async def _drain_background_tasks(adapter: WebhookAdapter, timeout: float = 5.0)
 
 
 @pytest.mark.asyncio
-async def test_completed_webhook_delivery_closes_its_session(tmp_path):
+async def test_completed_webhook_delivery_closes_its_session(tmp_path, monkeypatch):
     """After a webhook run finishes (REAL dispatch path), ended_at is set."""
     store = _make_store(tmp_path)
     runner = _FakeRunner(store)
@@ -110,6 +110,11 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
         }
     )
     adapter.gateway_runner = runner
+    lifecycle_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook_checked",
+        lambda hook_name, **kwargs: (lifecycle_calls.append((hook_name, kwargs)), ([], True))[1],
+    )
 
     # Stub the RUNNER-side handler (the seam the live gateway injects) — the
     # adapter's own handle_message / _process_message_background pipeline runs
@@ -144,10 +149,126 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
         "prune_sessions can never reap it (the ghost-session leak)"
     )
     assert row["end_reason"] == "webhook_complete"
+    assert lifecycle_calls == [(
+        "on_session_end",
+        {
+            "session_id": session_id,
+            "completed": True,
+            "interrupted": False,
+            "reason": "webhook_complete",
+            "platform": "webhook",
+            "outcome": "success",
+        },
+    )]
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert len(lifecycle_calls) == 1
 
     # And the closed row is actually prunable, unlike the pre-fix leak.
     pruned = store._db.prune_sessions(older_than_days=0, source="webhook")
     assert pruned >= 1
+    store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_webhook_delivery_fires_session_end_for_claim_finalizers(tmp_path, monkeypatch):
+    """A failed model turn still gives trusted plugins a fenced cleanup boundary."""
+    store = _make_store(tmp_path)
+    runner = _FakeRunner(store)
+    adapter = _make_adapter({
+        "alerts": {
+            "secret": _INSECURE_NO_AUTH,
+            "prompt": "Alert: {message}",
+            "deliver": "log",
+        }
+    })
+    adapter.gateway_runner = runner
+    lifecycle_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook_checked",
+        lambda hook_name, **kwargs: (lifecycle_calls.append((hook_name, kwargs)), ([], True))[1],
+    )
+    created = {}
+
+    async def _caught_failure_handler(event: MessageEvent):
+        entry = store.get_or_create_session(event.source)
+        created["session_id"] = entry.session_id
+        event._hermes_turn_failed = True
+        return "A safe error occurred"
+
+    adapter._message_handler = _caught_failure_handler
+    await adapter.handle_message(_make_event(adapter, "alert-fail-001", "fail safely"))
+    await _drain_background_tasks(adapter)
+
+    row = store._db.get_session(created["session_id"])
+    assert row is not None
+    assert row["ended_at"] is not None
+    assert lifecycle_calls == [(
+        "on_session_end",
+        {
+            "session_id": created["session_id"],
+            "completed": False,
+            "interrupted": False,
+            "reason": "webhook_complete",
+            "platform": "webhook",
+            "outcome": "failure",
+        },
+    )]
+    store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_webhook_delivery_reports_interrupted_once(tmp_path, monkeypatch):
+    store = _make_store(tmp_path)
+    runner = _FakeRunner(store)
+    adapter = _make_adapter({"alerts": {"secret": _INSECURE_NO_AUTH, "deliver": "log"}})
+    adapter.gateway_runner = runner
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook_checked",
+        lambda hook_name, **kwargs: (calls.append((hook_name, kwargs)), ([], True))[1],
+    )
+    event = _make_event(adapter, "alert-cancel-001", "cancel")
+    session_id = store.get_or_create_session(event.source).session_id
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+
+    assert calls == [(
+        "on_session_end",
+        {
+            "session_id": session_id,
+            "completed": False,
+            "interrupted": True,
+            "reason": "webhook_complete",
+            "platform": "webhook",
+            "outcome": "cancelled",
+        },
+    )]
+    store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_lifecycle_callback_remains_retryable(tmp_path, monkeypatch):
+    store = _make_store(tmp_path)
+    runner = _FakeRunner(store)
+    adapter = _make_adapter({"alerts": {"secret": _INSECURE_NO_AUTH, "deliver": "log"}})
+    adapter.gateway_runner = runner
+    event = _make_event(adapter, "alert-retry-001", "retry")
+    session_id = store.get_or_create_session(event.source).session_id
+    completions = iter((False, True))
+    calls = []
+
+    def checked(hook_name, **kwargs):
+        calls.append((hook_name, kwargs))
+        return [], next(completions)
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook_checked", checked)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+    assert session_id not in adapter._finalized_sessions
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    assert len(calls) == 2
+    assert session_id in adapter._finalized_sessions
     store._db.close()
 
 

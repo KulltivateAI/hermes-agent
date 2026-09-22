@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
 
@@ -197,12 +197,22 @@ class PluginDispatchMixin:
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
         caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
         """
+        return self.invoke_hook_checked(hook_name, **kwargs)[0]
+
+    def invoke_hook_checked(self, hook_name: str, **kwargs: Any) -> Tuple[List[Any], bool]:
+        """Invoke hooks and report whether every registered callback completed.
+
+        Ordinary delivery remains isolated and fail-open through ``invoke_hook``.
+        Trusted lifecycle owners use this checked form so a swallowed callback
+        exception or timeout cannot be mistaken for durable finalization.
+        """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
         # unrelated adapter payloads into one monolithic compatibility contract.
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         results: List[Any] = []
+        complete = True
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
@@ -211,6 +221,7 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
+                        complete = False
                         if fail_closed:  # policy hook: fail closed with a block directive
                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
@@ -219,8 +230,9 @@ class PluginDispatchMixin:
                 if ret is not None:
                     results.append(ret)
             except (Exception, SystemExit) as exc:
+                complete = False
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
-        return results
+        return results, complete
 
     def _report_hook_failure(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], exc: BaseException, *, surface: str = "Hook"

@@ -53,6 +53,25 @@ def test_distinct_hook_failures_each_warn(manager, caplog):
     assert len(warnings) == 3
 
 
+def test_checked_hook_reports_swallowed_callback_failure(manager):
+    attempts = []
+
+    def fails_once(**_kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("transient finalizer failure")
+        return "ok"
+
+    manager._hooks.setdefault("on_session_end", []).append(fails_once)
+    first_results, first_complete = manager.invoke_hook_checked("on_session_end", session_id="s1")
+    second_results, second_complete = manager.invoke_hook_checked("on_session_end", session_id="s1")
+
+    assert first_results == []
+    assert first_complete is False
+    assert second_results == ["ok"]
+    assert second_complete is True
+
+
 def test_middleware_failure_warns_once_and_unload_forgets_it(manager, caplog):
     """Middleware runs once per tool call like a hook, so it dedupes the same way; a plugin
     reload (unload-all) forgets the reported failures so the reloaded callback's first failure

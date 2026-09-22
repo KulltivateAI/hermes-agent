@@ -93,6 +93,9 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Set when the core converts an agent exception into a sanitized reply. A
+    # successful delivery of that reply must not classify the turn as success.
+    _hermes_turn_failed: bool = field(default=False, init=False, repr=False, compare=False)
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
