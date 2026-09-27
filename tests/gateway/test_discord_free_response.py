@@ -308,6 +308,30 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_discord_free_response_channel_auto_threads_admitted_bot_handoff(adapter, monkeypatch):
+    """An admitted bot handoff in a human-friendly channel gets an isolated thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)  # default true
+
+    channel = FakeTextChannel(channel_id=789)
+    thread = FakeThread(channel_id=123, parent=channel)
+    adapter._auto_create_thread = AsyncMock(return_value=thread)
+    message = make_message(channel=channel, content="<@999> design request")
+    message.author.bot = True
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "123"
+    assert event.source.chat_type == "thread"
+    assert event.source.parent_chat_id == "789"
+
+
+@pytest.mark.asyncio
 async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chronological_order(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     adapter.config.extra["history_backfill_limit"] = 10
