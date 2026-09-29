@@ -3,7 +3,7 @@
 import json
 import urllib.error
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -329,6 +329,128 @@ class TestErrorHandling:
         assert "something broke" in result["error"]
 
 
+class TestCreateHandoffThread:
+    CHANNEL_ID = "123456789012345678"
+    MESSAGE_ID = "223456789012345678"
+    TARGET_ID = "323456789012345678"
+    OWNER_ID = "423456789012345678"
+    THREAD_ID = "523456789012345678"
+
+    @patch("tools.discord_tool._discord_request")
+    def test_creates_anchored_thread_and_verifies_members(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": self.THREAD_ID, "name": "Handoff"},
+            None,
+            {"user_id": self.TARGET_ID},
+            None,
+            {"user_id": self.OWNER_ID},
+        ]
+
+        result = json.loads(discord_core(
+            action="create_handoff_thread",
+            channel_id=self.CHANNEL_ID,
+            message_id=self.MESSAGE_ID,
+            name="Handoff",
+            target_user_id=self.TARGET_ID,
+            owner_user_id=self.OWNER_ID,
+        ))
+
+        assert result == {
+            "success": True,
+            "thread_id": self.THREAD_ID,
+            "name": "Handoff",
+            "members": [
+                {"user_id": self.TARGET_ID, "verified": True},
+                {"user_id": self.OWNER_ID, "verified": True},
+            ],
+        }
+        assert mock_req.call_args_list == [
+            call(
+                "POST",
+                f"/channels/{self.CHANNEL_ID}/messages/{self.MESSAGE_ID}/threads",
+                "test-token",
+                body={"name": "Handoff", "auto_archive_duration": 1440},
+            ),
+            call("PUT", f"/channels/{self.THREAD_ID}/thread-members/{self.TARGET_ID}", "test-token"),
+            call("GET", f"/channels/{self.THREAD_ID}/thread-members/{self.TARGET_ID}", "test-token"),
+            call("PUT", f"/channels/{self.THREAD_ID}/thread-members/{self.OWNER_ID}", "test-token"),
+            call("GET", f"/channels/{self.THREAD_ID}/thread-members/{self.OWNER_ID}", "test-token"),
+        ]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_deduplicates_same_target_and_owner(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": self.THREAD_ID, "name": "Handoff"},
+            None,
+            {"user_id": self.TARGET_ID},
+        ]
+
+        result = json.loads(discord_core(
+            action="create_handoff_thread",
+            channel_id=self.CHANNEL_ID,
+            message_id=self.MESSAGE_ID,
+            name="Handoff",
+            target_user_id=self.TARGET_ID,
+            owner_user_id=self.TARGET_ID,
+        ))
+
+        assert result["members"] == [{"user_id": self.TARGET_ID, "verified": True}]
+        assert mock_req.call_count == 3
+
+    @patch("tools.discord_tool._discord_request")
+    def test_membership_verification_failure_deletes_partial_thread(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = [
+            {"id": self.THREAD_ID, "name": "Handoff"},
+            None,
+            {"user_id": self.OWNER_ID},
+            None,
+        ]
+
+        result = json.loads(discord_core(
+            action="create_handoff_thread",
+            channel_id=self.CHANNEL_ID,
+            message_id=self.MESSAGE_ID,
+            name="Handoff",
+            target_user_id=self.TARGET_ID,
+            owner_user_id=self.OWNER_ID,
+        ))
+
+        assert "membership verification failed" in result["error"]
+        assert f"Handoff thread {self.THREAD_ID}" in result["error"]
+        assert mock_req.call_args_list[-1] == call(
+            "DELETE", f"/channels/{self.THREAD_ID}", "test-token"
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("channel_id", "not-a-snowflake"),
+            ("message_id", "123"),
+            ("target_user_id", "323456789012345678x"),
+            ("owner_user_id", ""),
+        ],
+    )
+    @patch("tools.discord_tool._discord_request")
+    def test_rejects_malformed_ids_before_api_calls(self, mock_req, field, value, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        kwargs = {
+            "channel_id": self.CHANNEL_ID,
+            "message_id": self.MESSAGE_ID,
+            "name": "Handoff",
+            "target_user_id": self.TARGET_ID,
+            "owner_user_id": self.OWNER_ID,
+        }
+        kwargs[field] = value
+
+        result = json.loads(discord_core(action="create_handoff_thread", **kwargs))
+
+        assert field in result["error"]
+        mock_req.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -342,6 +464,11 @@ class TestRegistration:
         assert entry.toolset == "discord"
         assert entry.check_fn is not None
         assert entry.requires_env == ["DISCORD_BOT_TOKEN"]
+        actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
+        assert "create_handoff_thread" in actions
+        properties = entry.schema["parameters"]["properties"]
+        assert "target_user_id" in properties
+        assert "owner_user_id" in properties
 
     def test_all_actions_covered(self):
         """Core + admin actions should cover all known actions."""

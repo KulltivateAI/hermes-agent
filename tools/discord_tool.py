@@ -10,6 +10,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -369,6 +370,71 @@ def _create_thread(
     return json.dumps({"success": True, "thread_id": thread["id"], "name": thread.get("name")})
 
 
+_SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
+
+
+def _require_snowflake(field: str, value: Any) -> None:
+    if not isinstance(value, str) or not _SNOWFLAKE_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a 17-20 digit Discord snowflake")
+
+
+def _create_handoff_thread(
+    token: str,
+    channel_id: str,
+    message_id: str,
+    name: str,
+    target_user_id: str,
+    owner_user_id: str,
+    auto_archive_duration: int = 1440,
+    **_kwargs: Any,
+) -> str:
+    """Create an anchored public thread and prove required membership."""
+    for field, value in (
+        ("channel_id", channel_id),
+        ("message_id", message_id),
+        ("target_user_id", target_user_id),
+        ("owner_user_id", owner_user_id),
+    ):
+        _require_snowflake(field, value)
+
+    thread = _discord_request(
+        "POST",
+        f"/channels/{channel_id}/messages/{message_id}/threads",
+        token,
+        body={"name": name, "auto_archive_duration": auto_archive_duration},
+    )
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    _require_snowflake("thread_id", thread_id)
+
+    receipts = []
+    try:
+        for user_id in dict.fromkeys((target_user_id, owner_user_id)):
+            member_path = f"/channels/{thread_id}/thread-members/{user_id}"
+            _discord_request("PUT", member_path, token)
+            member = _discord_request("GET", member_path, token)
+            if not isinstance(member, dict) or member.get("user_id") != user_id:
+                raise RuntimeError(
+                    f"Discord membership verification failed for user_id {user_id}"
+                )
+            receipts.append({"user_id": user_id, "verified": True})
+    except Exception as error:
+        cleanup = "deleted"
+        try:
+            _discord_request("DELETE", f"/channels/{thread_id}", token)
+        except Exception:
+            cleanup = "failed"
+        raise RuntimeError(
+            f"Handoff thread {thread_id} membership setup failed; cleanup={cleanup}: {error}"
+        ) from error
+
+    return json.dumps({
+        "success": True,
+        "thread_id": thread_id,
+        "name": thread.get("name"),
+        "members": receipts,
+    })
+
+
 def _mutation(method: str, path: str, message: str):
     """Body-less write action: ``path``/``message`` are format templates over the action kwargs."""
     def _action(token: str, **kw: Any) -> str:
@@ -405,6 +471,12 @@ _ACTION_MANIFEST = [
     ("unpin_message", _unpin_message, "(channel_id, message_id)", "unpin a message"),
     ("delete_message", _delete_message, "(channel_id, message_id)", "delete a message"),
     ("create_thread", _create_thread, "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    (
+        "create_handoff_thread",
+        _create_handoff_thread,
+        "(channel_id, message_id, name, target_user_id, owner_user_id)",
+        "create an anchored public handoff thread and verify both members",
+    ),
     ("add_role", _add_role, "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", _remove_role, "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -415,7 +487,9 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
 
 # Two tools share one action table: ``discord`` (core, the participation trio every bot
 # user wants) and ``discord_admin`` (everything else).
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({
+    "fetch_messages", "search_members", "create_thread", "create_handoff_thread",
+})
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
 _ADMIN_ACTIONS = {k: v for k, v in _ACTIONS.items() if k not in _CORE_ACTION_NAMES}
 
@@ -476,6 +550,10 @@ _SCHEMA_PROPERTIES: Dict[str, Any] = {
     "guild_id": {"type": "string", "description": "Discord server (guild) ID."},
     "channel_id": {"type": "string", "description": "Discord channel ID."},
     "user_id": {"type": "string", "description": "Discord user ID."},
+    "target_user_id": {
+        "type": "string", "description": "Discord user ID that must receive the handoff thread."},
+    "owner_user_id": {
+        "type": "string", "description": "Discord owner user ID that must be enrolled in the handoff thread."},
     "role_id": {"type": "string", "description": "Discord role ID."},
     "message_id": {"type": "string", "description": "Discord message ID."},
     "query": {"type": "string", "description": "Member name prefix to search for (search_members)."},
@@ -554,6 +632,8 @@ _ACTION_403_HINT = {
     "unpin_message": f"{_NO_MANAGE_MESSAGES}.",
     "delete_message": f"{_NO_MANAGE_MESSAGES}, or cannot view the channel/message.",
     "create_thread": "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it.",
+    "create_handoff_thread": (
+        "Bot lacks CREATE_PUBLIC_THREADS, SEND_MESSAGES_IN_THREADS, or access to add a thread member."),
     "add_role": (
         f"{_ROLE_HIERARCHY} Roles can only be assigned below the bot's own position in the role hierarchy."),
     "remove_role": _ROLE_HIERARCHY,
@@ -581,7 +661,8 @@ def check_discord_tool_requirements() -> bool:
 # ── handlers ─────────────────────────────────────────────────────────────────
 _HANDLER_DEFAULTS = {
     "guild_id": "", "channel_id": "", "user_id": "", "role_id": "", "message_id": "", "query": "",
-    "name": "", "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440}
+    "target_user_id": "", "owner_user_id": "", "name": "", "limit": 50, "before": "", "after": "",
+    "auto_archive_duration": 1440}
 
 
 def _run_discord_action(action: str, valid_actions: Dict[str, Any], tool_label: str, **params: Any) -> str:
