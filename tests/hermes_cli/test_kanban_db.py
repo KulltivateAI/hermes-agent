@@ -1269,6 +1269,100 @@ def test_dispatch_dry_run_does_not_claim(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t2).status == "ready"
 
 
+def test_dispatch_exact_task_spawns_only_selected_ready(
+    kanban_home, all_assignees_spawnable
+):
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+
+    with kb.connect() as conn:
+        selected = kb.create_task(conn, title="selected", assignee="alice")
+        unrelated_ready = kb.create_task(conn, title="other ready", assignee="bob")
+        unrelated_review = kb.create_task(conn, title="other review", assignee="carol")
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?",
+            (unrelated_review,),
+        )
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, task_id=selected)
+
+        assert spawned == [selected]
+        assert [item[0] for item in res.spawned] == [selected]
+        assert kb.get_task(conn, unrelated_ready).status == "ready"
+        assert kb.get_task(conn, unrelated_review).status == "review"
+
+
+def test_concurrent_exact_dispatch_claims_once(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        selected = kb.create_task(conn, title="selected", assignee="alice")
+
+    def dispatch(_):
+        with kb.connect() as conn:
+            return kb.dispatch_once(
+                conn,
+                spawn_fn=lambda task, workspace: None,
+                task_id=selected,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(dispatch, range(2)))
+
+    assert sum(len(result.spawned) for result in results) == 1
+
+
+def test_exact_review_dispatch_respects_global_in_progress_cap(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="already running", assignee="alice")
+        selected = kb.create_task(conn, title="selected review", assignee="bob")
+        conn.execute(
+            "UPDATE tasks SET status = 'running' WHERE id = ?",
+            (running,),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?",
+            (selected,),
+        )
+
+        res = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            max_in_progress=1,
+            task_id=selected,
+        )
+
+        assert res.spawned == []
+        selected_task = kb.get_task(conn, selected)
+        assert selected_task is not None
+        assert selected_task.status == "review"
+
+
+@pytest.mark.parametrize("task_state", ["missing", "done", "archived"])
+def test_dispatch_exact_unknown_or_terminal_spawns_zero(
+    kanban_home, all_assignees_spawnable, task_state
+):
+    with kb.connect() as conn:
+        unrelated = kb.create_task(conn, title="unrelated", assignee="alice")
+        if task_state == "missing":
+            selected = "t_missing"
+        else:
+            selected = kb.create_task(conn, title=task_state, assignee="bob")
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (task_state, selected),
+            )
+
+        res = kb.dispatch_once(conn, dry_run=True, task_id=selected)
+
+        assert res.spawned == []
+        assert kb.get_task(conn, unrelated).status == "ready"
+
+
 def test_dispatch_skips_unassigned(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="floater")

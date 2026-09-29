@@ -57,7 +57,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
 
     monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
 
-    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=2, json=False, task="t_exact"
+    )
     kb_cli._cmd_dispatch(args)
 
     # Every config value must have reached dispatch_once.
@@ -69,6 +71,18 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("task_id") == "t_exact"
+
+
+def test_cli_dispatch_parser_accepts_exact_task(isolated_kanban_home):
+    from hermes_cli import kanban as kb_cli
+
+    parser = argparse.ArgumentParser()
+    kb_cli.build_parser(parser.add_subparsers(dest="command"))
+
+    args = parser.parse_args(["kanban", "dispatch", "--task", "t_exact"])
+
+    assert args.task == "t_exact"
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):

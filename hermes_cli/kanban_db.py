@@ -5943,6 +5943,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -5971,6 +5972,8 @@ def dispatch_once(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+    ``task_id`` restricts ready and review selection to one exact task while
+    preserving board-wide reclaim, promotion, and concurrency accounting.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -6008,16 +6011,22 @@ def dispatch_once(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
+    ready_query = (
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+    )
+    ready_params: tuple[str, ...] = ()
+    if task_id is not None:
+        ready_query += "AND id = ? "
+        ready_params = (task_id,)
+    ready_rows = conn.execute(
+        ready_query + "ORDER BY priority DESC, created_at ASC",
+        ready_params,
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
-    # tasks, skip spawning this tick so slow workers (local LLMs,
-    # resource-constrained hosts) can finish what they have before more tasks
-    # pile up and time out.
-    if max_in_progress is not None and ready_rows:
+    # Honour kanban.max_in_progress for both ready and review workers. The
+    # guard cannot depend on ready_rows: an exact review-only dispatch has no
+    # ready row, but still consumes the same board-wide worker capacity.
+    if max_in_progress is not None:
         in_progress = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
@@ -6244,10 +6253,17 @@ def dispatch_once(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    review_rows = conn.execute(
+    review_query = (
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+    )
+    review_params: tuple[str, ...] = ()
+    if task_id is not None:
+        review_query += "AND id = ? "
+        review_params = (task_id,)
+    review_rows = conn.execute(
+        review_query + "ORDER BY priority DESC, created_at ASC",
+        review_params,
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
