@@ -139,6 +139,48 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch_task(args: argparse.Namespace) -> int:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        per_profile = kbd._positive_int(kanban_cfg.get("max_in_progress_per_profile"), 0) or None
+        max_in_progress = kbd.resolve_max_in_progress(
+            kbd._positive_int(kanban_cfg.get("max_in_progress"), 0) or None
+        )
+        max_spawn = kbd._positive_int(kanban_cfg.get("max_spawn"), 0) or None
+    except Exception:
+        default_assignee = per_profile = max_in_progress = max_spawn = None
+    with kbc.connect_closing() as conn:
+        res = kbd.dispatch_task(
+            conn, args.task_id, dry_run=args.dry_run,
+            max_spawn=max_spawn, max_in_progress=max_in_progress,
+            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=per_profile,
+        )
+    payload = {
+        "task_id": args.task_id,
+        "spawned": [
+            {"task_id": tid, "assignee": who, "workspace": ws}
+            for (tid, who, ws) in res.spawned
+        ],
+        "skipped_locked": res.skipped_locked,
+        "skipped_unassigned": res.skipped_unassigned,
+        "skipped_nonspawnable": res.skipped_nonspawnable,
+        "skipped_per_profile_capped": [
+            {"task_id": tid, "assignee": who, "current": current}
+            for (tid, who, current) in res.skipped_per_profile_capped
+        ],
+    }
+    if getattr(args, "json", False):
+        _print_json(payload, ascii=True)
+    else:
+        print(f"Exact task {args.task_id}: {'spawned' if res.spawned else 'not spawned'}")
+    return 0
+
+
 _DAEMON_DEPRECATED = (
     "hermes kanban daemon: DEPRECATED — the dispatcher now runs\ninside the gateway. To use "
     "kanban:\n\n    hermes gateway start       # starts the gateway + embedded dispatcher\n\nReady "

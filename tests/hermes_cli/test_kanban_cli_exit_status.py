@@ -58,3 +58,15 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
 
     assert refused.returncode == 1
     assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+
+def test_delegated_child_cannot_exact_dispatch_task(tmp_path):
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    refused = _run_hermes(
+        home, "kanban", "dispatch-task", "t_deadbeef", "--json", marker=True,
+    )
+
+    assert refused.returncode == 1
+    assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
