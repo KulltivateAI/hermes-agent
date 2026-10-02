@@ -346,6 +346,12 @@ _SPECS = [
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
         _json_flag(),
     ], help="One dispatcher pass: reclaim stale, promote ready, spawn workers"),
+    _cmd("dispatch-task", [
+        _TASK_ID,
+        _arg("--dry-run", action="store_true", help="Validate exact dispatch without spawning"),
+        _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT),
+        _json_flag(),
+    ], help="Claim and spawn exactly one ready/review task without sweeping the board"),
     _cmd("daemon", [
         _arg("--interval", type=float, default=60.0, help="Seconds between dispatch ticks (default: 60)"),
         _arg("--max", type=int, help="Cap number of spawns per tick"),

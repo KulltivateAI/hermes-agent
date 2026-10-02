@@ -1474,6 +1474,74 @@ def dispatch_once(
     return result
 
 
+def dispatch_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    dry_run: bool = False,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> DispatchResult:
+    """Claim and spawn only ``task_id``; never sweep or mutate sibling tasks."""
+    result = DispatchResult()
+    try:
+        db_path = _kb.kanban_db_path(board=board)
+    except Exception:
+        return result
+    with _kbc._dispatch_tick_lock(db_path) as held:
+        if not held:
+            return DispatchResult(skipped_locked=True)
+        may_spawn, _ = _tick_spawn_budget(
+            conn, result, max_spawn=max_spawn,
+            max_in_progress=max_in_progress, board=board,
+        )
+        if not may_spawn:
+            return result
+        row = conn.execute(
+            "SELECT id, assignee, status FROM tasks "
+            "WHERE id = ? AND status IN ('ready', 'review') AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if row is None or (row["status"] == "review" and not review_dispatch_enabled()):
+            return result
+        assignee = row["assignee"] or _resolve_default_assignee(default_assignee)
+        if not assignee:
+            result.skipped_unassigned.append(task_id)
+            return result
+        if not row["assignee"] and not _apply_default_assignee(
+            conn, task_id, assignee, dry_run=dry_run,
+        ):
+            result.skipped_unassigned.append(task_id)
+            return result
+        per_profile_cap = max_in_progress_per_profile if (
+            isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0
+        ) else None
+        per_profile_running: dict[str, int] = {}
+        if per_profile_cap is not None:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?",
+                (assignee,),
+            ).fetchone()[0]
+            per_profile_running[assignee] = int(count)
+        _dispatch_lane_task(
+            conn, row, assignee, result, lane=row["status"],
+            dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+            failure_limit=failure_limit, spawn_fn=spawn_fn,
+            per_profile_cap=per_profile_cap,
+            per_profile_running=per_profile_running,
+        )
+        _kbc._maybe_checkpoint_wal(conn, db_path)
+    _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    return result
+
+
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
