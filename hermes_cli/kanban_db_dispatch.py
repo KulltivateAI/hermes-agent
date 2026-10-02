@@ -1429,6 +1429,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    task_ids: Optional[set[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1452,6 +1453,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            task_ids=task_ids,
         )
 
     try:
@@ -1708,12 +1710,26 @@ def _tick_spawn_budget(
     return True, spawn_budget
 
 
-def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
+def _lane_rows(
+    conn: sqlite3.Connection,
+    status: str,
+    task_ids: Optional[set[str]] = None,
+) -> list[sqlite3.Row]:
+    """Unclaimed rows of one lane in dispatch order, optionally exact-filtered."""
+    if task_ids == set():
+        return []
+    sql = (
         "SELECT id, assignee FROM tasks "
-        f"WHERE status = '{status}' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "WHERE status = ? AND claim_lock IS NULL "
+    )
+    params: list[Any] = [status]
+    if task_ids is not None:
+        selected = sorted(task_ids)
+        sql += f"AND id IN ({','.join('?' for _ in selected)}) "
+        params.extend(selected)
+    return conn.execute(
+        sql + "ORDER BY priority DESC, created_at ASC",
+        params,
     ).fetchall()
 
 
@@ -1761,6 +1777,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    task_ids: Optional[set[str]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -1778,10 +1795,10 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
-    ready_rows = _lane_rows(conn, "ready")
+    ready_rows = _lane_rows(conn, "ready", task_ids)
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
-    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    review_rows = _lane_rows(conn, "review", task_ids) if review_dispatch_enabled() else []
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold

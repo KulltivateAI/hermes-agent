@@ -90,6 +90,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            task_ids={args.task} if getattr(args, "task", None) is not None else None,
         )
     if getattr(args, "json", False):
         _print_json({
