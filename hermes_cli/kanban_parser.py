@@ -341,6 +341,7 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
+        _arg("--task", metavar="TASK_ID", help="Dispatch only this ready or review task"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
