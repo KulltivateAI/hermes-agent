@@ -613,12 +613,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _cc_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
-    stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
     from agent.mandate_manifest import load_agent_manifest, render_agent_mandate
     mandate_home = _agent_home(agent) or get_hermes_home()
     mandate = load_agent_manifest(mandate_home)  # Invalid opted-in manifests fail closed.
-    if mandate:
-        stable_parts.append(render_agent_mandate(mandate, mandate_home))
+    stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    if mandate:  # Renderer-owned frame must precede every user-controlled byte.
+        stable_parts.insert(0, render_agent_mandate(mandate, mandate_home))
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
