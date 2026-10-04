@@ -61,21 +61,27 @@ def test_authority_inference_uses_only_approved_action_semantics(outcome, author
     assert ("reviewed merge and deployment" in mgr.state.contract.authority) is authorized
 
 
-@pytest.mark.parametrize("disposition", ["routine_choice", "external_prerequisite"])
-def test_protected_reason_forces_human_gate_regardless_of_judge_label(disposition):
-    mgr = _set(disposition)
-    with patch.object(goals, "judge_goal", return_value=_judge(disposition, "Payment approval is required")):
-        decision = mgr.evaluate_after_turn("waiting")
+@pytest.mark.parametrize("verdict,reason,response", [
+    ("done", "looks good", "Ready to send customer emails"),
+    ("continue", "Delete the production records next", "working"),
+    ("blocked", "Production database schema change needs approval", "waiting"),
+])
+def test_protected_language_forces_human_gate_under_every_verdict(verdict, reason, response):
+    mgr = _set(verdict)
+    with patch.object(goals, "judge_goal", return_value=_judge("routine_choice", reason, verdict)):
+        decision = mgr.evaluate_after_turn(response)
     assert decision["status"] == "paused"
     assert decision["disposition"] == "human_gate"
 
 
 def test_named_gate_requires_exact_identity_and_default_accepts_named_approver():
-    alice = goals._authorization_envelope("fix", goals.GoalContract(human_gates="Alice approves release"))
-    assert goals._matches_declared_human_gate("Alice must approve", alice)
-    assert not goals._matches_declared_human_gate("Bob must approve release", alice)
+    alice = goals._authorization_envelope("fix", goals.GoalContract(human_gates="Alice Smith approves release"))
+    assert goals._matches_declared_human_gate("Alice Smith must approve", alice)
+    assert not goals._matches_declared_human_gate("Alice Jones must approve", alice)
+    assert not goals._matches_declared_human_gate("Alice must approve", alice)
     default = goals._authorization_envelope("fix", goals.GoalContract(verification="pytest"))
     assert goals._matches_declared_human_gate("Drew must approve", default)
+    assert not goals._matches_declared_human_gate("send the report", default)
 
 
 def test_undeclared_ordinary_choice_continues_correctively():
@@ -108,10 +114,15 @@ def test_rejecting_exception_review_clears_goal():
     assert not result.error and not goals.GoalManager("reject").has_goal()
 
 
-def test_partial_delivery_cannot_take_done_path():
-    mgr = _set("partial")
+@pytest.mark.parametrize("response", [
+    "CI passed, PR opened, awaiting maintainer approval",
+    "Pull request opened and CI passed",
+    "Awaiting review and approval",
+])
+def test_partial_delivery_cannot_take_done_path(response):
+    mgr = _set(response)
     with patch.object(goals, "judge_goal", return_value=_judge("", "looks good", verdict="done")):
-        decision = mgr.evaluate_after_turn("PR is open with green CI; waiting for review")
+        decision = mgr.evaluate_after_turn(response)
     assert decision["verdict"] == "continue" and mgr.state.status == "active"
     assert "open PR" in goals.JUDGE_SYSTEM_PROMPT and "green CI" in goals.JUDGE_SYSTEM_PROMPT
 

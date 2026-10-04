@@ -357,33 +357,33 @@ def _authorization_envelope(goal: str, contract: GoalContract) -> GoalContract:
 
 def _matches_declared_human_gate(reason: str, contract: GoalContract) -> bool:
     """Conservatively match a judge reason to protected categories or a declared named gate."""
-    reason_lower = reason.lower()
-    protected = ("payment", "charge", "customer send", "auth", "session", "migration",
-                 "dns", "pricing", "spend", "legal", "product strategy", "destructive data")
-    if any(term in reason_lower for term in protected):
+    protected = (
+        r"\b(?:payments?|charg(?:e|es|ing)|auth(?:entication|orization)?|sessions?|migrations?|dns|pricing|spend|legal|product strategy|destructive data)\b",
+        r"\b(?:customer|client)s?\s+(?:emails?|messages?|sends?)\b|\b(?:emails?|messages?|send(?:ing)?)\b.{0,24}\b(?:customer|client)s?\b",
+        r"\b(?:delet\w*|destroy\w*|truncat\w*|remov\w*|purg\w*|drop)\b.{0,30}\b(?:production|prod|data|records?)\b|\b(?:production|prod|data|records?)\b.{0,30}\b(?:delet\w*|destroy\w*|truncat\w*|remov\w*|purg\w*|drop)\b",
+        r"\b(?:production|prod)\b.{0,20}\b(?:database|db)\b.{0,12}\b(?:schema|migration)\b|\b(?:database|db)\b.{0,12}\b(?:schema|migration)\b.{0,20}\b(?:production|prod)\b",
+    )
+    if any(re.search(pattern, reason, re.I) for pattern in protected):
         return True
     declared = contract.human_gates.replace(_PROTECTED_HUMAN_GATES, "")
-    excluded = {"Always", "Need", "Waiting", "Payment", "Customer", "Auth", "Pricing", "Legal", "Product"}
-    def names(text):
-        return ({w for w in re.findall(r"\b[A-Z][a-z]+\b", text) if w not in excluded}
-                if re.search(r"\b(approv|sign.?off|permission)", text, re.I) else set())
-    declared_names, reason_names = names(declared), names(reason)
+    gate_words = r"\b(?:approv\w*|sign(?:s|ed)?\s+off|permission)\b"
+    declared_names = re.findall(r"\b([A-Z][a-z]+(?: [A-Z][a-z]+)*)\s+(?:must\s+)?(?:approv\w*|signs?\s+off)", declared)
     if declared_names:
-        return bool(declared_names & reason_names)
-    if reason_names and "any named approver" in contract.human_gates.lower():
+        return bool(re.search(gate_words, reason, re.I) and any(re.search(rf"\b{re.escape(name)}\b", reason, re.I) for name in declared_names))
+    if "any named approver" in contract.human_gates.lower() and re.search(gate_words, reason, re.I) and re.search(r"\b(?!(?:Awaiting|Waiting|Need|Human|Review|Approval)\b)[A-Z][a-z]+\b", reason):
         return True
     ignored = {"approve", "approves", "approval", "required", "requires", "human", "gate"}
     terms = {w for w in re.findall(r"[a-z]+", declared.lower()) if len(w) >= 4 and w not in ignored}
-    return bool(terms & set(re.findall(r"[a-z]+", reason_lower)))
+    return bool(terms & set(re.findall(r"[a-z]+", reason.lower())))
 
 
 def _partial_delivery(goal: str, contract: GoalContract, response: str) -> bool:
     requested = (contract.outcome or goal).lower()
     if not re.search(r"\b(build|fix|ship|live)\b", requested):
         return False
-    partial = re.search(r"\b(green ci|ci (?:is )?green|open (?:pr|pull request)|(?:pr|pull request) (?:is )?open|ticket created|(?:waiting|awaiting) (?:for )?review|review (?:is )?pending)\b", response.lower())
-    complete = re.search(r"\b(deployed|shipped|production verified|verified (?:in )?production|is live|live (?:at|in|on)|built artifact)\b", response.lower())
-    return bool(partial and not complete)
+    partial = re.search(r"\b(green ci|ci (?:is |has )?(?:green|pass(?:ed|ing))|open(?:ed)? (?:pr|pull request)|(?:pr|pull request) (?:is |has been )?open(?:ed)?|ticket created|(?:waiting|awaiting)(?: for| on)?(?: \w+){0,2} (?:review|approval)|review (?:is )?pending)\b", response.lower())
+    final = re.search(r"\b(production verified|verified (?:in )?production|(?:final|live) verification (?:passed|complete))\b", response.lower())
+    return bool(partial and not final)
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
@@ -1661,6 +1661,9 @@ class GoalManager(GoalFencingMixin):
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
         self._owned_row()
+        gate_text = f"{reason}\n{last_response}"
+        if _matches_declared_human_gate(gate_text, state.contract):
+            verdict, wait_directive = "blocked", {"disposition": "human_gate"}
         if verdict == "done" and _partial_delivery(state.goal, state.contract, last_response):
             verdict, reason, wait_directive = "continue", "partial delivery is not completion", None
         state.last_verdict = verdict
@@ -1683,9 +1686,7 @@ class GoalManager(GoalFencingMixin):
         # of scope, needs user input). See #100954.
         if verdict == "blocked":
             disposition = (wait_directive or {}).get("disposition", "no_safe_path")
-            if _matches_declared_human_gate(reason, state.contract):
-                disposition = "human_gate"
-            elif disposition == "human_gate":
+            if disposition == "human_gate" and not _matches_declared_human_gate(gate_text, state.contract):
                 disposition = "routine_choice"
             state.blocked_disposition = disposition
             if disposition == "routine_choice":
