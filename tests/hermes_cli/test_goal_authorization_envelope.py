@@ -53,12 +53,13 @@ def test_old_contracts_and_bare_goals_do_not_gain_new_metadata():
 
 
 @pytest.mark.parametrize("outcome,verification,boundaries", [
-    ("Open a PR for the fix", "PR URL exists", "stop after opening the PR"),
+    ("Open a PR for the fix", "PR URL exists", ""),
     ("Review the fix", "review verdict exists", "review only"),
     ("Draft a deployment plan", "plan file exists", "do not deploy"),
     ("Build the fix locally", "local tests pass", "local only; no merge"),
     ("Do not deploy the fix", "local tests pass", "no deployment"),
-    ("Ship the fix", "PR URL exists", "stop at verification"),
+    ("Build the fix", "PR URL exists", "stop at PR"),
+    ("Ship a draft release note", "draft note exists", ""),
 ])
 def test_explicit_stopping_boundary_wins_over_fix_or_deploy_words(outcome, verification, boundaries):
     mgr = _set(outcome, goal="fix it", outcome=outcome, verification=verification, boundaries=boundaries)
@@ -66,10 +67,25 @@ def test_explicit_stopping_boundary_wins_over_fix_or_deploy_words(outcome, verif
     assert "not tool permission" in mgr.render_contract()
 
 
-def test_explicit_live_intent_has_workflow_scope_but_not_tool_permission():
-    mgr = _set("live", goal="ship it live", outcome="Deploy the fix live", verification="production check passes")
+@pytest.mark.parametrize("outcome", [
+    "Deploy the fix live",
+    "Deploy after PR review",
+    "Deploy live; PR is not stopping point",
+])
+def test_explicit_live_outcome_wins_over_pr_mentions(outcome):
+    mgr = _set(outcome, goal="fix it", outcome=outcome, verification="PR URL exists")
     assert "merge/deploy workflow" in mgr.state.contract.authority.lower()
     assert "does not grant tool permission" in mgr.state.contract.authority
+
+
+def test_live_outcome_rejects_done_when_contract_only_verifies_pr():
+    mgr = _set("live-pr-proof", goal="fix it", outcome="Deploy the fix live", verification="PR URL exists")
+    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR URL verified", verdict="done")):
+        decision = mgr.evaluate_after_turn("Opened https://github.com/acme/repo/pull/7")
+    assert decision["verdict"] == "continue"
+    assert decision["status"] == "active"
+    assert "live verification" in decision["continuation_prompt"].lower()
+    assert "correct the completion contract" in decision["continuation_prompt"].lower()
 
 
 def test_pr_only_contract_can_complete_at_pr_url():
@@ -122,10 +138,13 @@ def test_two_routine_blockers_require_fresh_delegate_review_without_admin_bypass
     with patch.object(goals, "judge_goal", return_value=blocked):
         first = mgr.evaluate_after_turn("choice?")
         second = mgr.evaluate_after_turn("still blocked")
+    persisted = goals.load_goal(mgr.session_id)
+    assert persisted is not None
     assert first["status"] == second["status"] == "active"
     assert "delegate_task" in second["continuation_prompt"]
     assert "fresh independent exception review" in second["continuation_prompt"]
-    assert f"Goal generation: {mgr.state.generation}" in second["continuation_prompt"]
+    assert f"Goal ID: {persisted.goal_id}" in second["continuation_prompt"]
+    assert f"Goal generation: {persisted.generation}" in second["continuation_prompt"]
     assert "exception-reviewed" not in second["continuation_prompt"]
     assert is_goal_control("exception-reviewed approve")
 

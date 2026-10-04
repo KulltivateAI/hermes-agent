@@ -302,11 +302,18 @@ _ROUTINE_CHOICE_PROMPT = (
 )
 _EXCEPTION_REVIEW_PROMPT = (
     "[Continuation review required after repeated routine blockers]\n"
+    "Goal ID: {goal_id}\n"
     "Goal generation: {generation}\n"
     "Keep the goal active. Before choosing the path, dispatch a fresh independent exception review "
-    "with delegate_task. Give it the exact current goal generation, contract, blocker, and candidate "
+    "with delegate_task. Give it the exact current goal ID, generation, contract, blocker, and candidate "
     "path; then use its findings to choose the smallest safe path and continue. This review is "
     "continuity guidance only and cannot waive tool or action protections."
+)
+_LIVE_VERIFICATION_REQUIRED_PROMPT = (
+    "[Completion contract correction required]\n"
+    "The Outcome requires a live merge/deploy result, but Verification proves only a PR artifact. "
+    "Keep the goal active: obtain concrete live verification, or correct the completion contract "
+    "if the intended stopping boundary is the PR. Do not declare DONE from PR-only evidence."
 )
 
 
@@ -339,33 +346,49 @@ class GoalContract:
         return "\n".join(f"- {_CONTRACT_LABELS[f]}: {getattr(self, f).strip()}" for f in _CONTRACT_FIELDS if getattr(self, f).strip())
 
 
-def _authorization_envelope(goal: str, contract: GoalContract) -> GoalContract:
-    """Add visible workflow metadata; never grant permission to tools or actions."""
-    contract = deepcopy(contract)
-    outcome = (contract.outcome or goal).lower()
-    verification = contract.verification.lower()
-    limits = " ".join((contract.boundaries, contract.stop_when)).lower()
-    outcome_words = re.sub(r"[^a-z0-9]+", " ", outcome).split()
-    words = set(outcome_words)
+def _delivery_scope(contract: GoalContract) -> str:
+    """Return inferred workflow scope from structured completion fields only."""
+    outcome = re.sub(r"[^a-z0-9]+", " ", contract.outcome.lower()).strip()
+    limits = re.sub(
+        r"[^a-z0-9]+", " ", " ".join((contract.outcome, contract.boundaries, contract.stop_when)).lower()
+    ).strip()
+    words = set(outcome.split())
+    first_word = outcome.split()[0] if outcome else ""
     restricted = (
-        (bool(outcome_words) and outcome_words[0] in {"review", "plan", "audit", "draft"})
-        or bool(words & {"local", "pr"})
-        or "pull request" in outcome
-        or "pr url" in verification or "pull request url" in verification
-        or any(phrase in f"{outcome} {limits}" for phrase in (
+        first_word in {"review", "plan", "audit", "draft"}
+        or any(phrase in limits for phrase in (
             "review only", "plan only", "audit only", "draft only", "local only", "pr only",
-            "stop after opening the pr", "stop after opening the pull request",
-            "do not merge", "no merge", "do not deploy", "no deploy",
+            "pull request only", "stop at pr", "stop at pull request", "stop after opening the pr",
+            "stop after opening the pull request", "do not merge", "no merge", "do not deploy",
+            "no deploy", "no deployment",
         ))
+        or ("draft" in words and not words & {"deploy", "merge", "live"})
+        or (
+            ("pr" in words or "pull request" in outcome)
+            and first_word in {"open", "create", "submit", "raise"}
+        )
     )
     if restricted:
+        return "restricted"
+    if words & {"deploy", "merge", "live"} or (outcome.startswith("ship ") and "draft" not in words):
+        return "live"
+    return "restricted"
+
+
+def _has_pr_only_verification(contract: GoalContract) -> bool:
+    verification = re.sub(r"[^a-z0-9]+", " ", contract.verification.lower()).strip()
+    proves_pr = "pr url" in verification or "pull request url" in verification
+    proves_live = bool(set(verification.split()) & {"live", "production", "deployed", "deployment", "release"})
+    return proves_pr and not proves_live
+
+
+def _authorization_envelope(contract: GoalContract) -> GoalContract:
+    """Add visible workflow metadata; never grant permission to tools or actions."""
+    contract = deepcopy(contract)
+    if _delivery_scope(contract) == "live":
+        contract.authority = "Merge/deploy workflow is in scope after review."
+    else:
         contract.authority = "No merge or deployment workflow scope; stop at the authoritative contract boundary."
-    elif not contract.authority:
-        contract.authority = (
-            "Merge/deploy workflow is in scope after review."
-            if words & {"ship", "live", "merge", "deploy"}
-            else "No merge or deployment workflow scope inferred."
-        )
     contract.authority += " Workflow scope does not grant tool permission or bypass action protections."
     if _DEFAULT_HUMAN_GATE_IDS not in contract.human_gates:
         contract.human_gates = ", ".join(filter(None, (contract.human_gates, _DEFAULT_HUMAN_GATE_IDS)))
@@ -1281,7 +1304,7 @@ class GoalManager(GoalFencingMixin):
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
-            contract=_authorization_envelope(goal, contract) if contract is not None and not contract.is_empty()
+            contract=_authorization_envelope(contract) if contract is not None and not contract.is_empty()
             else GoalContract(),
         )
         return self._save()
@@ -1291,7 +1314,7 @@ class GoalManager(GoalFencingMixin):
         """Attach or replace the completion contract on the active goal."""
         if self._state is None:
             return None
-        self._state.contract = (_authorization_envelope(self._state.goal, contract)
+        self._state.contract = (_authorization_envelope(contract)
                                 if contract is not None and not contract.is_empty() else GoalContract())
         return self._save()
 
@@ -1667,7 +1690,9 @@ class GoalManager(GoalFencingMixin):
             if disposition == "routine_choice":
                 state.routine_blocker_count += 1
                 prompt = (_ROUTINE_CHOICE_PROMPT if state.routine_blocker_count < 2
-                          else _EXCEPTION_REVIEW_PROMPT.format(generation=state.generation))
+                          else _EXCEPTION_REVIEW_PROMPT.format(
+                              goal_id=state.goal_id, generation=state.generation
+                          ))
                 self._save()
                 return _decision("active", True, prompt, "continue", reason,
                                  "↻ Routine choice rejected as a human blocker.", disposition)
@@ -1679,6 +1704,15 @@ class GoalManager(GoalFencingMixin):
             if disposition == "human_gate":
                 decision["gate_id"] = gate_id
             return decision
+
+        if verdict == "done" and _delivery_scope(state.contract) == "live" and _has_pr_only_verification(state.contract):
+            state.last_verdict = "continue"
+            state.last_reason = "live outcome has only PR verification"
+            self._save()
+            return _decision(
+                "active", True, _LIVE_VERIFICATION_REQUIRED_PROMPT, "continue", state.last_reason,
+                "↻ Live delivery still requires live verification.",
+            )
 
         if verdict == "done":
             state.status = "done"
