@@ -18,10 +18,12 @@ def isolated_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
-def _judge(disposition="", reason="working", verdict="continue", gate_id=""):
+def _judge(disposition="", reason="working", verdict="continue", gate_id="", evidence_stage=None):
     directive = {"disposition": disposition}
     if gate_id:
         directive["gate_id"] = gate_id
+    if evidence_stage is not None:
+        directive["evidence_stage"] = evidence_stage
     return verdict, reason, False, directive, False
 
 
@@ -67,6 +69,20 @@ def test_explicit_stopping_boundary_wins_over_fix_or_deploy_words(outcome, verif
     assert "not tool permission" in mgr.render_contract()
 
 
+@pytest.mark.parametrize("outcome,boundaries,stage", [
+    ("Deploy the fix live", "", "deployed"),
+    ("Ship the release", "", "deployed"),
+    ("Merge the fix", "", "merged"),
+    ("Open a PR for the fix", "", "pr"),
+    ("Deploy the fix live", "stop at PR", "pr"),
+    ("Deploy the fix live", "do not deploy", "merged"),
+    ("Ship a draft release note", "", "none"),
+])
+def test_completion_stage_is_derived_from_outcome_and_boundaries(outcome, boundaries, stage):
+    mgr = _set(outcome, outcome=outcome, verification="anything", boundaries=boundaries)
+    assert mgr.state.contract.completion_stage == stage
+
+
 @pytest.mark.parametrize("outcome", [
     "Deploy the fix live",
     "Deploy after PR review",
@@ -78,29 +94,58 @@ def test_explicit_live_outcome_wins_over_pr_mentions(outcome):
     assert "does not grant tool permission" in mgr.state.contract.authority
 
 
-def test_live_outcome_rejects_done_when_contract_only_verifies_pr():
-    mgr = _set("live-pr-proof", goal="fix it", outcome="Deploy the fix live", verification="PR URL exists")
-    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR URL verified", verdict="done")):
-        decision = mgr.evaluate_after_turn("Opened https://github.com/acme/repo/pull/7")
+@pytest.mark.parametrize("verification", [
+    "PR exists", "opened pull request exists", "release PR URL exists",
+    "PR checks pass", "pull request #7 exists",
+])
+@pytest.mark.parametrize("outcome", ["Deploy the fix live", "Merge the fix"])
+def test_pr_evidence_cannot_complete_deployed_or_merged_goal_regardless_of_verification_wording(verification, outcome):
+    mgr = _set(verification, goal="fix it", outcome=outcome, verification=verification)
+    with patch.object(goals, "judge_goal", return_value=_judge(
+            reason="PR verified", verdict="done", evidence_stage="pr")):
+        decision = mgr.evaluate_after_turn("Opened pull request #7")
     assert decision["verdict"] == "continue"
     assert decision["status"] == "active"
-    assert "live verification" in decision["continuation_prompt"].lower()
-    assert "correct the completion contract" in decision["continuation_prompt"].lower()
+    assert f"completion_stage={goals._completion_stage(mgr.state.contract)}" in decision["continuation_prompt"]
+    assert "evidence_stage=pr" in decision["continuation_prompt"]
 
 
-def test_pr_only_contract_can_complete_at_pr_url():
-    mgr = _set("pr", goal="fix it", outcome="Open a PR for the fix", verification="PR URL exists")
-    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR URL verified", verdict="done")):
-        decision = mgr.evaluate_after_turn("Opened https://github.com/acme/repo/pull/7")
+@pytest.mark.parametrize("verification", [
+    "PR exists", "opened pull request exists", "release PR URL exists",
+    "PR checks pass", "pull request #7 exists",
+])
+def test_pr_evidence_can_complete_pr_only_goal_regardless_of_verification_wording(verification):
+    mgr = _set("pr", goal="fix it", outcome="Open a PR for the fix", verification=verification)
+    with patch.object(goals, "judge_goal", return_value=_judge(
+            reason="PR verified", verdict="done", evidence_stage="pr")):
+        decision = mgr.evaluate_after_turn("Opened pull request #7")
     assert decision["verdict"] == "done" and mgr.state.status == "done"
 
 
-def test_live_contract_continues_until_judge_confirms_live_verification():
-    mgr = _set("prod", goal="ship it live", outcome="Deploy the fix live", verification="production check passes")
-    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR exists but production is unverified")):
-        assert mgr.evaluate_after_turn("PR opened")["verdict"] == "continue"
-    with patch.object(goals, "judge_goal", return_value=_judge(reason="production check passed", verdict="done")):
-        assert mgr.evaluate_after_turn("Production check passed")["verdict"] == "done"
+@pytest.mark.parametrize("outcome,evidence_stage", [
+    ("Merge the fix", "merged"), ("Merge the fix", "deployed"), ("Deploy the fix live", "deployed"),
+])
+def test_sufficient_merged_or_deployed_evidence_can_complete(outcome, evidence_stage):
+    mgr = _set(evidence_stage, goal="ship it", outcome=outcome, verification="release evidence exists")
+    with patch.object(goals, "judge_goal", return_value=_judge(
+            reason="delivery verified", verdict="done", evidence_stage=evidence_stage)):
+        assert mgr.evaluate_after_turn("Delivery verified")["verdict"] == "done"
+
+
+@pytest.mark.parametrize("evidence_stage", [None, "bogus", "pr"])
+def test_missing_invalid_or_insufficient_stage_keeps_delivery_goal_active(evidence_stage):
+    mgr = _set(str(evidence_stage), goal="ship it", outcome="Merge the fix", verification="release evidence")
+    with patch.object(goals, "judge_goal", return_value=_judge(
+            reason="done", verdict="done", evidence_stage=evidence_stage)):
+        decision = mgr.evaluate_after_turn("done")
+    assert decision["verdict"] == "continue"
+    assert "completion_stage=merged" in decision["continuation_prompt"]
+
+
+def test_old_judge_result_still_completes_non_delivery_legacy_goal():
+    mgr = _set("legacy", goal="write report", outcome="Write a report", verification="report exists")
+    with patch.object(goals, "judge_goal", return_value=_judge(reason="report verified", verdict="done")):
+        assert mgr.evaluate_after_turn("Report exists")["verdict"] == "done"
 
 
 def test_exact_normalized_structured_gate_id_parks():
@@ -117,6 +162,13 @@ def test_structured_gate_id_survives_judge_json_parsing():
     )
     assert directive is not None
     assert (verdict, failed, directive["gate_id"]) == ("blocked", False, "release_approval")
+
+
+@pytest.mark.parametrize("value,expected", [("pr", "pr"), ("garbage", "invalid")])
+def test_judge_evidence_stage_is_structured_and_validated(value, expected):
+    verdict, _, failed, directive = goals._parse_judge_response(
+        json.dumps({"verdict": "done", "evidence_stage": value, "reason": "verified"}))
+    assert (verdict, failed, directive["evidence_stage"]) == ("done", False, expected)
 
 
 @pytest.mark.parametrize("gate_id,reason", [

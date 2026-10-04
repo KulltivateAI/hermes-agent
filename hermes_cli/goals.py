@@ -159,17 +159,18 @@ JUDGE_SYSTEM_PROMPT = (
     "finishes.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
-    "When a completion contract is present, its Outcome, Verification, and Boundaries are authoritative. "
-    "A named artifact can satisfy a goal whose Verification requires that artifact; require production/live "
-    "evidence only when the contract requires it. Workflow scope metadata never grants tool permission or "
+    "When a completion contract is present, its Outcome, Verification, Boundaries, and Completion stage are "
+    "authoritative. Classify the strongest concrete workflow evidence in the response as evidence_stage: "
+    "none, pr, merged, or deployed. Do not derive it from the wording of the Verification field. Workflow "
+    "completion metadata never grants tool permission or "
     "bypasses action protections.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
-    '{"verdict": "done", "reason": "<one sentence>"}\n'
-    '{"verdict": "blocked", "disposition": "<kind>", "gate_id": "<declared id when human_gate>", "reason": "<one sentence>"}\n'
-    '{"verdict": "continue", "reason": "<one sentence>"}\n'
-    '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
-    '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
-    '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
+    '{"verdict": "done", "evidence_stage": "<none|pr|merged|deployed>", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "evidence_stage": "<none|pr|merged|deployed>", "disposition": "<kind>", "gate_id": "<declared id when human_gate>", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "evidence_stage": "<none|pr|merged|deployed>", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "evidence_stage": "<none|pr|merged|deployed>", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "evidence_stage": "<none|pr|merged|deployed>", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
+    '{"verdict": "wait", "evidence_stage": "<none|pr|merged|deployed>", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
     "The legacy shape {\"done\": <true|false>, \"reason\": \"...\"} is still "
     "accepted (true=done, false=continue)."
 )
@@ -265,13 +266,13 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 # The five contract fields, in display order (after OpenAI Codex's "strong goal" guidance: what
 # "done" means, how to prove it, what must not regress, what is in bounds, when to stop and ask).
 # A bare free-form goal stays fully supported — empty fields are omitted from every prompt.
-_COMPLETION_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
+_COMPLETION_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when", "completion_stage")
 _AUTHORIZATION_FIELDS = ("authority", "human_gates", "exceptions")
 _CONTRACT_FIELDS = _COMPLETION_FIELDS + _AUTHORIZATION_FIELDS
 
 _CONTRACT_LABELS = {
     "outcome": "Outcome", "verification": "Verification", "constraints": "Constraints",
-    "boundaries": "Boundaries", "stop_when": "Stop when blocked",
+    "boundaries": "Boundaries", "stop_when": "Stop when blocked", "completion_stage": "Completion stage",
     "authority": "Workflow scope (not tool permission)", "human_gates": "Human gate IDs", "exceptions": "Exceptions",
 }
 
@@ -309,11 +310,11 @@ _EXCEPTION_REVIEW_PROMPT = (
     "path; then use its findings to choose the smallest safe path and continue. This review is "
     "continuity guidance only and cannot waive tool or action protections."
 )
-_LIVE_VERIFICATION_REQUIRED_PROMPT = (
-    "[Completion contract correction required]\n"
-    "The Outcome requires a live merge/deploy result, but Verification proves only a PR artifact. "
-    "Keep the goal active: obtain concrete live verification, or correct the completion contract "
-    "if the intended stopping boundary is the PR. Do not declare DONE from PR-only evidence."
+_STAGE_REQUIRED_PROMPT = (
+    "[Completion stage evidence required]\n"
+    "This goal requires completion_stage={required}; the judge reported evidence_stage={actual}. "
+    "Keep the goal active and obtain concrete evidence at stage {required} or later. "
+    "Do not declare DONE at an earlier workflow stage."
 )
 
 
@@ -325,6 +326,7 @@ class GoalContract:
     constraints: str = ""
     boundaries: str = ""
     stop_when: str = ""
+    completion_stage: str = ""
     authority: str = ""
     human_gates: str = ""
     exceptions: str = ""
@@ -346,47 +348,52 @@ class GoalContract:
         return "\n".join(f"- {_CONTRACT_LABELS[f]}: {getattr(self, f).strip()}" for f in _CONTRACT_FIELDS if getattr(self, f).strip())
 
 
-def _delivery_scope(contract: GoalContract) -> str:
-    """Return inferred workflow scope from structured completion fields only."""
+_STAGE_ORDER = {"none": 0, "pr": 1, "merged": 2, "deployed": 3}
+
+
+def _completion_stage(contract: GoalContract) -> str:
+    """Derive the required workflow stage from outcome and explicit stopping boundaries."""
     outcome = re.sub(r"[^a-z0-9]+", " ", contract.outcome.lower()).strip()
     limits = re.sub(
         r"[^a-z0-9]+", " ", " ".join((contract.outcome, contract.boundaries, contract.stop_when)).lower()
     ).strip()
     words = set(outcome.split())
     first_word = outcome.split()[0] if outcome else ""
-    restricted = (
-        first_word in {"review", "plan", "audit", "draft"}
-        or any(phrase in limits for phrase in (
-            "review only", "plan only", "audit only", "draft only", "local only", "pr only",
-            "pull request only", "stop at pr", "stop at pull request", "stop after opening the pr",
-            "stop after opening the pull request", "do not merge", "no merge", "do not deploy",
-            "no deploy", "no deployment",
-        ))
-        or ("draft" in words and not words & {"deploy", "merge", "live"})
-        or (
-            ("pr" in words or "pull request" in outcome)
-            and first_word in {"open", "create", "submit", "raise"}
-        )
-    )
-    if restricted:
-        return "restricted"
-    if words & {"deploy", "merge", "live"} or (outcome.startswith("ship ") and "draft" not in words):
-        return "live"
-    return "restricted"
-
-
-def _has_pr_only_verification(contract: GoalContract) -> bool:
-    verification = re.sub(r"[^a-z0-9]+", " ", contract.verification.lower()).strip()
-    proves_pr = "pr url" in verification or "pull request url" in verification
-    proves_live = bool(set(verification.split()) & {"live", "production", "deployed", "deployment", "release"})
-    return proves_pr and not proves_live
+    none_boundary = first_word in {"review", "plan", "audit", "draft"} or any(
+        phrase in limits for phrase in ("review only", "plan only", "audit only", "draft only", "local only")
+    ) or ("draft" in words and not words & {"deploy", "merge", "live"})
+    if none_boundary:
+        return "none"
+    if any(phrase in limits for phrase in (
+        "pr only", "pull request only", "stop at pr", "stop at pull request",
+        "stop after opening the pr", "stop after opening the pull request",
+    )):
+        return "pr"
+    if outcome.startswith(("do not deploy ", "do not merge ")):
+        desired = "none"
+    elif words & {"deploy", "live"} or (first_word == "ship" and "draft" not in words):
+        desired = "deployed"
+    elif "merge" in words or "merged" in words:
+        desired = "merged"
+    elif ("pr" in words or "pull request" in outcome) and first_word in {"open", "create", "submit", "raise"}:
+        desired = "pr"
+    else:
+        desired = "none"
+    if any(phrase in limits for phrase in ("do not merge", "no merge")):
+        return min((desired, "pr"), key=lambda stage: _STAGE_ORDER[stage])
+    if any(phrase in limits for phrase in ("do not deploy", "no deploy", "no deployment")):
+        return min((desired, "merged"), key=lambda stage: _STAGE_ORDER[stage])
+    return desired
 
 
 def _authorization_envelope(contract: GoalContract) -> GoalContract:
     """Add visible workflow metadata; never grant permission to tools or actions."""
     contract = deepcopy(contract)
-    if _delivery_scope(contract) == "live":
+    contract.completion_stage = _completion_stage(contract)
+    if contract.completion_stage == "deployed":
         contract.authority = "Merge/deploy workflow is in scope after review."
+    elif contract.completion_stage == "merged":
+        contract.authority = "Merge workflow is in scope after review; deployment is out of scope."
     else:
         contract.authority = "No merge or deployment workflow scope; stop at the authoritative contract boundary."
     contract.authority += " Workflow scope does not grant tool permission or bypass action protections."
@@ -936,13 +943,14 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
     if verdict != "wait":
+        raw_stage = str(data.get("evidence_stage") or "").strip().lower()
+        evidence_stage = raw_stage if raw_stage in _STAGE_ORDER else ("invalid" if "evidence_stage" in data else "missing")
         disposition = str(data.get("disposition") or "").strip().lower()
-        directive = ({
-            "disposition": disposition,
-            "gate_id": str(data.get("gate_id") or "").strip(),
-        } if verdict == "blocked" and disposition in {
-            "human_gate", "external_prerequisite", "no_safe_path", "routine_choice"
-        } else None)
+        directive = {"evidence_stage": evidence_stage} if "evidence_stage" in data else None
+        if verdict == "blocked" and disposition in {
+                "human_gate", "external_prerequisite", "no_safe_path", "routine_choice"}:
+            directive = directive or {}
+            directive.update(disposition=disposition, gate_id=str(data.get("gate_id") or "").strip())
         return verdict, reason, False, directive
 
     def _first_int(*keys: str) -> Optional[int]:
@@ -1054,7 +1062,9 @@ def judge_goal(
         current_time=datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
     )
     if contract is not None and not contract.is_empty():
-        contract_block = contract.render_block()
+        judged_contract = deepcopy(contract)
+        judged_contract.completion_stage = _completion_stage(contract)
+        contract_block = judged_contract.render_block()
         if clean_subgoals:
             contract_block = f"{contract_block}\n{_render_extra_criteria(clean_subgoals)}"
         prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(contract_block=_truncate(contract_block, 2500), **common)
@@ -1660,7 +1670,7 @@ class GoalManager(GoalFencingMixin):
             return gate_decision
 
         self._owned_row()
-        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
+        verdict, reason, parse_failed, judge_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
@@ -1675,16 +1685,16 @@ class GoalManager(GoalFencingMixin):
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
-        if verdict == "wait" and wait_directive:
-            return self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+        if verdict == "wait" and judge_directive:
+            return self._apply_wait_directive(judge_directive, reason, active_delegations=active_delegations)
 
         # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
         # instead of burning turns on an unachievable goal or waving it through as complete.
         # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
         # of scope, needs user input). See #100954.
         if verdict == "blocked":
-            disposition = (wait_directive or {}).get("disposition", "no_safe_path")
-            gate_id = _normalize_gate_id((wait_directive or {}).get("gate_id", ""))
+            disposition = (judge_directive or {}).get("disposition", "no_safe_path")
+            gate_id = _normalize_gate_id((judge_directive or {}).get("gate_id", ""))
             if disposition == "human_gate" and not _declares_gate(state.contract, gate_id):
                 disposition = "routine_choice"
             if disposition == "routine_choice":
@@ -1705,13 +1715,16 @@ class GoalManager(GoalFencingMixin):
                 decision["gate_id"] = gate_id
             return decision
 
-        if verdict == "done" and _delivery_scope(state.contract) == "live" and _has_pr_only_verification(state.contract):
+        required_stage = _completion_stage(state.contract)
+        evidence_stage = (judge_directive or {}).get("evidence_stage", "missing")
+        if (verdict == "done" and required_stage != "none"
+                and _STAGE_ORDER.get(evidence_stage, -1) < _STAGE_ORDER[required_stage]):
             state.last_verdict = "continue"
-            state.last_reason = "live outcome has only PR verification"
+            state.last_reason = f"completion_stage={required_stage} requires stronger evidence_stage than {evidence_stage}"
             self._save()
             return _decision(
-                "active", True, _LIVE_VERIFICATION_REQUIRED_PROMPT, "continue", state.last_reason,
-                "↻ Live delivery still requires live verification.",
+                "active", True, _STAGE_REQUIRED_PROMPT.format(required=required_stage, actual=evidence_stage),
+                "continue", state.last_reason, f"↻ Completion still requires {required_stage} evidence.",
             )
 
         if verdict == "done":
