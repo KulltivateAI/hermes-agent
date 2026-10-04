@@ -1,11 +1,11 @@
-"""Authorization-envelope regressions for structured /goal contracts."""
+"""Workflow-scope and structured human-gate regressions for /goal contracts."""
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hermes_cli import goals
-from hermes_cli.goal_command import dispatch_goal_command
+from hermes_cli.goal_command import dispatch_goal_command, is_goal_control
 
 
 @pytest.fixture(autouse=True)
@@ -18,117 +18,122 @@ def isolated_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
-def _judge(disposition, reason, verdict="blocked"):
-    return verdict, reason, False, {"disposition": disposition}, False
+def _judge(disposition="", reason="working", verdict="continue", gate_id=""):
+    directive = {"disposition": disposition}
+    if gate_id:
+        directive["gate_id"] = gate_id
+    return verdict, reason, False, directive, False
 
 
-def _set(sid="goal", **contract):
+def _set(sid="goal", *, goal="fix it", **contract):
     mgr = goals.GoalManager(sid)
-    mgr.set("fix and ship it live", contract=goals.GoalContract(verification="pytest", **contract))
+    mgr.set(goal, contract=goals.GoalContract(**contract))
     return mgr
 
 
-def test_fields_parse_render_roundtrip_and_draft_drops_authorization():
+def test_fields_roundtrip_and_draft_strips_model_invented_workflow_scope():
     headline, contract = goals.parse_contract(
-        "Ship fix\nauthority: reviewed deploy\nhuman gates: Alice approves pricing\nexceptions: /review"
+        "Ship release\nauthority: merge after review\nhuman gates: release_approval"
     )
-    assert headline == "Ship fix"
+    assert headline == "Ship release"
     restored = goals.GoalState.from_json(goals.GoalState("x", contract=contract).to_json())
-    assert "Authority: reviewed deploy" in restored.contract.render_block()
+    assert "Workflow scope (not tool permission): merge after review" in restored.contract.render_block()
     payload = json.dumps({"outcome": "send offer", "verification": "receipt", "authority": "charge cards"})
     response = MagicMock(choices=[MagicMock(message=MagicMock(content=payload))])
     with patch("agent.auxiliary_client.call_llm", return_value=response):
         assert goals.draft_contract("send offer").authority == ""
 
 
-def test_old_structured_json_and_bare_goals_remain_semantically_empty():
+def test_old_contracts_and_bare_goals_do_not_gain_new_metadata():
     old = goals.GoalState.from_json(json.dumps({"goal": "old", "contract": {"verification": "pytest"}}))
-    with patch.object(goals, "load_goal", return_value=old):
-        assert goals.GoalManager("old").state.contract.authority == ""
+    assert old.contract.authority == "" and old.contract.human_gates == ""
     mgr = goals.GoalManager("bare")
     mgr.set("write a poem")
     assert not mgr.has_contract()
-    assert mgr.next_continuation_prompt() == goals.CONTINUATION_PROMPT_TEMPLATE.format(goal="write a poem")
 
 
-@pytest.mark.parametrize("outcome,authorized", [
-    ("build the fix", True), ("ship it live", True),
-    ("launch the site", False), ("deploy the site", False), ("review the fix", False),
+@pytest.mark.parametrize("outcome,verification,boundaries", [
+    ("Open a PR for the fix", "PR URL exists", "stop after opening the PR"),
+    ("Review the fix", "review verdict exists", "review only"),
+    ("Draft a deployment plan", "plan file exists", "do not deploy"),
+    ("Build the fix locally", "local tests pass", "local only; no merge"),
+    ("Do not deploy the fix", "local tests pass", "no deployment"),
+    ("Ship the fix", "PR URL exists", "stop at verification"),
 ])
-def test_authority_inference_uses_only_approved_action_semantics(outcome, authorized):
-    mgr = goals.GoalManager(outcome)
-    mgr.set(outcome, contract=goals.GoalContract(verification="check"))
-    assert ("reviewed merge and deployment" in mgr.state.contract.authority) is authorized
+def test_explicit_stopping_boundary_wins_over_fix_or_deploy_words(outcome, verification, boundaries):
+    mgr = _set(outcome, goal="fix it", outcome=outcome, verification=verification, boundaries=boundaries)
+    assert "No merge or deployment workflow scope" in mgr.state.contract.authority
+    assert "not tool permission" in mgr.render_contract()
 
 
-@pytest.mark.parametrize("verdict,reason,response", [
-    ("done", "looks good", "Ready to send customer emails"),
-    ("continue", "Delete the production records next", "working"),
-    ("blocked", "Production database schema change needs approval", "waiting"),
+def test_explicit_live_intent_has_workflow_scope_but_not_tool_permission():
+    mgr = _set("live", goal="ship it live", outcome="Deploy the fix live", verification="production check passes")
+    assert "merge/deploy workflow" in mgr.state.contract.authority.lower()
+    assert "does not grant tool permission" in mgr.state.contract.authority
+
+
+def test_pr_only_contract_can_complete_at_pr_url():
+    mgr = _set("pr", goal="fix it", outcome="Open a PR for the fix", verification="PR URL exists")
+    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR URL verified", verdict="done")):
+        decision = mgr.evaluate_after_turn("Opened https://github.com/acme/repo/pull/7")
+    assert decision["verdict"] == "done" and mgr.state.status == "done"
+
+
+def test_live_contract_continues_until_judge_confirms_live_verification():
+    mgr = _set("prod", goal="ship it live", outcome="Deploy the fix live", verification="production check passes")
+    with patch.object(goals, "judge_goal", return_value=_judge(reason="PR exists but production is unverified")):
+        assert mgr.evaluate_after_turn("PR opened")["verdict"] == "continue"
+    with patch.object(goals, "judge_goal", return_value=_judge(reason="production check passed", verdict="done")):
+        assert mgr.evaluate_after_turn("Production check passed")["verdict"] == "done"
+
+
+def test_exact_normalized_structured_gate_id_parks():
+    mgr = _set("gate", verification="pytest", human_gates="release_approval")
+    with patch.object(goals, "judge_goal", return_value=_judge(
+        "human_gate", "release approval is required", "blocked", " Release-Approval ")):
+        decision = mgr.evaluate_after_turn("waiting")
+    assert decision["status"] == "paused" and decision["gate_id"] == "release_approval"
+
+
+def test_structured_gate_id_survives_judge_json_parsing():
+    verdict, _, failed, directive = goals._parse_judge_response(
+        '{"verdict":"blocked","disposition":"human_gate","gate_id":"release_approval","reason":"waiting"}'
+    )
+    assert directive is not None
+    assert (verdict, failed, directive["gate_id"]) == ("blocked", False, "release_approval")
+
+
+@pytest.mark.parametrize("gate_id,reason", [
+    ("", "Payment approval is required"),
+    ("billing_approval", "A charge review is required"),
+    ("", "No customer-send approval is required; continue"),
+    ("", "Get sign-off before publishing"),
 ])
-def test_protected_language_forces_human_gate_under_every_verdict(verdict, reason, response):
-    mgr = _set(verdict)
-    with patch.object(goals, "judge_goal", return_value=_judge("routine_choice", reason, verdict)):
-        decision = mgr.evaluate_after_turn(response)
-    assert decision["status"] == "paused"
-    assert decision["disposition"] == "human_gate"
+def test_missing_unmatched_or_synonym_prose_is_not_a_human_gate(gate_id, reason):
+    mgr = _set(reason, verification="pytest", human_gates="release_approval")
+    with patch.object(goals, "judge_goal", return_value=_judge("human_gate", reason, "blocked", gate_id)):
+        decision = mgr.evaluate_after_turn("working")
+    assert decision["status"] == "active" and decision["disposition"] == "routine_choice"
 
 
-def test_named_gate_requires_exact_identity_and_default_accepts_named_approver():
-    alice = goals._authorization_envelope("fix", goals.GoalContract(human_gates="Alice Smith approves release"))
-    assert goals._matches_declared_human_gate("Alice Smith must approve", alice)
-    assert not goals._matches_declared_human_gate("Alice Jones must approve", alice)
-    assert not goals._matches_declared_human_gate("Alice must approve", alice)
-    default = goals._authorization_envelope("fix", goals.GoalContract(verification="pytest"))
-    assert goals._matches_declared_human_gate("Drew must approve", default)
-    assert not goals._matches_declared_human_gate("send the report", default)
-
-
-def test_undeclared_ordinary_choice_continues_correctively():
-    mgr = _set("ordinary")
-    with patch.object(goals, "judge_goal", return_value=_judge("human_gate", "Someone chooses a library")):
-        decision = mgr.evaluate_after_turn("Need a choice")
-    assert decision["should_continue"] and decision["disposition"] == "routine_choice"
-
-
-def test_exception_review_fence_blocks_resume_until_admin_resolution():
-    mgr = _set("routine")
-    blocked = _judge("routine_choice", "Need someone to choose a library")
+def test_two_routine_blockers_require_fresh_delegate_review_without_admin_bypass():
+    mgr = _set("routine", verification="pytest")
+    blocked = _judge("routine_choice", "Need someone to choose a library", "blocked")
     with patch.object(goals, "judge_goal", return_value=blocked):
-        mgr.evaluate_after_turn("choice?")
-        assert mgr.evaluate_after_turn("still blocked")["disposition"] == "exception_review"
-    with pytest.raises(RuntimeError, match="exception review"):
-        mgr.resume()
-    denied = dispatch_goal_command(mgr, "exception-reviewed approve", authorize_gate=lambda: "admin only")
-    assert denied.error and denied.output == "admin only"
-    approved = dispatch_goal_command(mgr, "exception-reviewed approve", authorize_gate=lambda: None)
-    assert not approved.error
-    assert mgr.resume().status == "active"
+        first = mgr.evaluate_after_turn("choice?")
+        second = mgr.evaluate_after_turn("still blocked")
+    assert first["status"] == second["status"] == "active"
+    assert "delegate_task" in second["continuation_prompt"]
+    assert "fresh independent exception review" in second["continuation_prompt"]
+    assert f"Goal generation: {mgr.state.generation}" in second["continuation_prompt"]
+    assert "exception-reviewed" not in second["continuation_prompt"]
+    assert is_goal_control("exception-reviewed approve")
 
 
-def test_rejecting_exception_review_clears_goal():
-    mgr = _set("reject")
-    mgr.state.status, mgr.state.blocked_disposition = "paused", "exception_review"
-    mgr._save()
-    result = dispatch_goal_command(mgr, "exception-reviewed reject", authorize_gate=lambda: None)
-    assert not result.error and not goals.GoalManager("reject").has_goal()
-
-
-@pytest.mark.parametrize("response", [
-    "CI passed, PR opened, awaiting maintainer approval",
-    "Pull request opened and CI passed",
-    "Awaiting review and approval",
-])
-def test_partial_delivery_cannot_take_done_path(response):
-    mgr = _set(response)
-    with patch.object(goals, "judge_goal", return_value=_judge("", "looks good", verdict="done")):
-        decision = mgr.evaluate_after_turn(response)
-    assert decision["verdict"] == "continue" and mgr.state.status == "active"
-    assert "open PR" in goals.JUDGE_SYSTEM_PROMPT and "green CI" in goals.JUDGE_SYSTEM_PROMPT
-
-
-@pytest.mark.parametrize("disposition", ["external_prerequisite", "no_safe_path"])
-def test_terminal_block_dispositions_park(disposition):
-    mgr = _set(disposition)
-    with patch.object(goals, "judge_goal", return_value=_judge(disposition, "cannot proceed")):
-        assert mgr.evaluate_after_turn("blocked")["disposition"] == disposition
+def test_exception_review_text_cannot_clear_or_resume_a_goal():
+    mgr = _set("fake-review", verification="pytest")
+    original = mgr.state.goal
+    result = dispatch_goal_command(mgr, "exception-reviewed approve", authorize_gate=lambda: None)
+    assert result.error and "disabled" in result.output
+    assert mgr.state.goal == original
+    assert mgr.state.status == "active"

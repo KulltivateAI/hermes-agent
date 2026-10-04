@@ -131,7 +131,7 @@ JUDGE_SYSTEM_PROMPT = (
     "user input to proceed.\n"
     "Return BLOCKED with the reason and one disposition: human_gate, "
     "external_prerequisite, no_safe_path, or routine_choice. human_gate is valid "
-    "only for a gate declared in the completion contract; ordinary implementation "
+    "only with the exact structured gate_id declared in the completion contract; ordinary implementation "
     "choices are routine_choice. BLOCKED is "
     "a refusal, not a completion — never return BLOCKED for a goal that "
     "was achieved.\n\n"
@@ -159,11 +159,13 @@ JUDGE_SYSTEM_PROMPT = (
     "finishes.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
-    "For build/fix/ship/live outcomes, partial milestones are never DONE: green CI only, "
-    "an open PR, a created ticket, or waiting for review all require CONTINUE or WAIT.\n\n"
+    "When a completion contract is present, its Outcome, Verification, and Boundaries are authoritative. "
+    "A named artifact can satisfy a goal whose Verification requires that artifact; require production/live "
+    "evidence only when the contract requires it. Workflow scope metadata never grants tool permission or "
+    "bypasses action protections.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
-    '{"verdict": "blocked", "disposition": "<kind>", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "disposition": "<kind>", "gate_id": "<declared id when human_gate>", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -270,7 +272,7 @@ _CONTRACT_FIELDS = _COMPLETION_FIELDS + _AUTHORIZATION_FIELDS
 _CONTRACT_LABELS = {
     "outcome": "Outcome", "verification": "Verification", "constraints": "Constraints",
     "boundaries": "Boundaries", "stop_when": "Stop when blocked",
-    "authority": "Authority", "human_gates": "Human gates", "exceptions": "Exceptions",
+    "authority": "Workflow scope (not tool permission)", "human_gates": "Human gate IDs", "exceptions": "Exceptions",
 }
 
 # Inline-input aliases the user may type before a value (`verify: tests pass`, `done when: ...`).
@@ -289,15 +291,22 @@ _CONTRACT_ALIASES = {
     "exceptions": "exceptions", "exception": "exceptions",
 }
 
-_PROTECTED_HUMAN_GATES = (
-    "Always non-delegable: payments/charges; real customer sends; auth/session; "
-    "DB migrations; DNS; pricing/spend/legal/product strategy; destructive data; "
-    "any named approver."
+_DEFAULT_HUMAN_GATE_IDS = (
+    "payments, customer_sends, auth_session, db_migrations, dns, "
+    "pricing_spend_legal_strategy, destructive_data"
 )
 _ROUTINE_CHOICE_PROMPT = (
     "[Authorization correction — routine choice is not a human blocker]\n"
     "Choose the smallest durable safe path consistent with the goal and continue. "
     "Do not ask a human to make an ordinary implementation choice."
+)
+_EXCEPTION_REVIEW_PROMPT = (
+    "[Continuation review required after repeated routine blockers]\n"
+    "Goal generation: {generation}\n"
+    "Keep the goal active. Before choosing the path, dispatch a fresh independent exception review "
+    "with delegate_task. Give it the exact current goal generation, contract, blocker, and candidate "
+    "path; then use its findings to choose the smallest safe path and continue. This review is "
+    "continuity guidance only and cannot waive tool or action protections."
 )
 
 
@@ -331,59 +340,46 @@ class GoalContract:
 
 
 def _authorization_envelope(goal: str, contract: GoalContract) -> GoalContract:
-    """Fill conservative defaults for a structured contract; bare goals stay bare."""
+    """Add visible workflow metadata; never grant permission to tools or actions."""
     contract = deepcopy(contract)
-    requested = (contract.outcome or goal).lower()
-    if not contract.authority:
-        if re.search(r"\b(plan|review|audit|assess|analy[sz]e)\b", requested):
-            contract.authority = "Analysis only; merge and deployment are not authorized."
-        elif re.search(r"\b(build|fix|ship|live)\b", requested):
-            contract.authority = (
-                "Implementation plus ordinary low-risk reviewed merge and deployment are authorized "
-                "when needed for this outcome; protected categories remain human-gated."
-            )
-        else:
-            contract.authority = "No merge or deployment authority inferred."
-    if "protected human gates" not in contract.authority.lower():
-        contract.authority += " Authority never overrides protected human gates."
-    if _PROTECTED_HUMAN_GATES not in contract.human_gates:
-        contract.human_gates = "; ".join(filter(None, (contract.human_gates, _PROTECTED_HUMAN_GATES)))
-    if not contract.exceptions:
-        contract.exceptions = (
-            "Independent exception review uses the existing /review path and cannot waive a human gate."
+    outcome = (contract.outcome or goal).lower()
+    verification = contract.verification.lower()
+    limits = " ".join((contract.boundaries, contract.stop_when)).lower()
+    outcome_words = re.sub(r"[^a-z0-9]+", " ", outcome).split()
+    words = set(outcome_words)
+    restricted = (
+        (bool(outcome_words) and outcome_words[0] in {"review", "plan", "audit", "draft"})
+        or bool(words & {"local", "pr"})
+        or "pull request" in outcome
+        or "pr url" in verification or "pull request url" in verification
+        or any(phrase in f"{outcome} {limits}" for phrase in (
+            "review only", "plan only", "audit only", "draft only", "local only", "pr only",
+            "stop after opening the pr", "stop after opening the pull request",
+            "do not merge", "no merge", "do not deploy", "no deploy",
+        ))
+    )
+    if restricted:
+        contract.authority = "No merge or deployment workflow scope; stop at the authoritative contract boundary."
+    elif not contract.authority:
+        contract.authority = (
+            "Merge/deploy workflow is in scope after review."
+            if words & {"ship", "live", "merge", "deploy"}
+            else "No merge or deployment workflow scope inferred."
         )
+    contract.authority += " Workflow scope does not grant tool permission or bypass action protections."
+    if _DEFAULT_HUMAN_GATE_IDS not in contract.human_gates:
+        contract.human_gates = ", ".join(filter(None, (contract.human_gates, _DEFAULT_HUMAN_GATE_IDS)))
     return contract
 
 
-def _matches_declared_human_gate(reason: str, contract: GoalContract) -> bool:
-    """Conservatively match a judge reason to protected categories or a declared named gate."""
-    protected = (
-        r"\b(?:payments?|charg(?:e|es|ing)|auth(?:entication|orization)?|sessions?|migrations?|dns|pricing|spend|legal|product strategy|destructive data)\b",
-        r"\b(?:customer|client)s?\s+(?:emails?|messages?|sends?)\b|\b(?:emails?|messages?|send(?:ing)?)\b.{0,24}\b(?:customer|client)s?\b",
-        r"\b(?:delet\w*|destroy\w*|truncat\w*|remov\w*|purg\w*|drop)\b.{0,30}\b(?:production|prod|data|records?)\b|\b(?:production|prod|data|records?)\b.{0,30}\b(?:delet\w*|destroy\w*|truncat\w*|remov\w*|purg\w*|drop)\b",
-        r"\b(?:production|prod)\b.{0,20}\b(?:database|db)\b.{0,12}\b(?:schema|migration)\b|\b(?:database|db)\b.{0,12}\b(?:schema|migration)\b.{0,20}\b(?:production|prod)\b",
-    )
-    if any(re.search(pattern, reason, re.I) for pattern in protected):
-        return True
-    declared = contract.human_gates.replace(_PROTECTED_HUMAN_GATES, "")
-    gate_words = r"\b(?:approv\w*|sign(?:s|ed)?\s+off|permission)\b"
-    declared_names = re.findall(r"\b([A-Z][a-z]+(?: [A-Z][a-z]+)*)\s+(?:must\s+)?(?:approv\w*|signs?\s+off)", declared)
-    if declared_names:
-        return bool(re.search(gate_words, reason, re.I) and any(re.search(rf"\b{re.escape(name)}\b", reason, re.I) for name in declared_names))
-    if "any named approver" in contract.human_gates.lower() and re.search(gate_words, reason, re.I) and re.search(r"\b(?!(?:Awaiting|Waiting|Need|Human|Review|Approval)\b)[A-Z][a-z]+\b", reason):
-        return True
-    ignored = {"approve", "approves", "approval", "required", "requires", "human", "gate"}
-    terms = {w for w in re.findall(r"[a-z]+", declared.lower()) if len(w) >= 4 and w not in ignored}
-    return bool(terms & set(re.findall(r"[a-z]+", reason.lower())))
+def _normalize_gate_id(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
 
 
-def _partial_delivery(goal: str, contract: GoalContract, response: str) -> bool:
-    requested = (contract.outcome or goal).lower()
-    if not re.search(r"\b(build|fix|ship|live)\b", requested):
-        return False
-    partial = re.search(r"\b(green ci|ci (?:is |has )?(?:green|pass(?:ed|ing))|open(?:ed)? (?:pr|pull request)|(?:pr|pull request) (?:is |has been )?open(?:ed)?|ticket created|(?:waiting|awaiting)(?: for| on)?(?: \w+){0,2} (?:review|approval)|review (?:is )?pending)\b", response.lower())
-    final = re.search(r"\b(production verified|verified (?:in )?production|(?:final|live) verification (?:passed|complete))\b", response.lower())
-    return bool(partial and not final)
+def _declares_gate(contract: GoalContract, gate_id: str) -> bool:
+    normalized = _normalize_gate_id(gate_id)
+    declared = {_normalize_gate_id(value) for value in re.split(r"[,;\n]", contract.human_gates)}
+    return bool(normalized and normalized in declared)
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
@@ -536,7 +532,6 @@ class GoalState:
     evaluation_id: str = ""
     continuation_id: str = ""
     notice_id: str = ""
-    blocked_disposition: str = ""
     routine_blocker_count: int = 0
 
     def to_json(self) -> str:
@@ -555,7 +550,6 @@ class GoalState:
             evaluation_id=str(data.get("evaluation_id") or ""),
             continuation_id=str(data.get("continuation_id") or ""),
             notice_id=str(data.get("notice_id") or ""),
-            blocked_disposition=str(data.get("blocked_disposition") or ""),
             status=data.get("status", "active"),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
@@ -920,7 +914,10 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         verdict = "continue"
     if verdict != "wait":
         disposition = str(data.get("disposition") or "").strip().lower()
-        directive = ({"disposition": disposition} if verdict == "blocked" and disposition in {
+        directive = ({
+            "disposition": disposition,
+            "gate_id": str(data.get("gate_id") or "").strip(),
+        } if verdict == "blocked" and disposition in {
             "human_gate", "external_prerequisite", "no_safe_path", "routine_choice"
         } else None)
         return verdict, reason, False, directive
@@ -1311,8 +1308,6 @@ class GoalManager(GoalFencingMixin):
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
-        if self._state.blocked_disposition == "exception_review":
-            raise RuntimeError("independent exception review must be resolved before resume")
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
@@ -1324,20 +1319,6 @@ class GoalManager(GoalFencingMixin):
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
-
-    @goal_control
-    def resolve_exception_review(self, approve: bool) -> None:
-        state = self._require_goal()
-        if state.blocked_disposition != "exception_review":
-            raise RuntimeError("no exception review is pending")
-        if not approve:
-            state.status = "cleared"
-            self._save()
-            self._state = None
-            return
-        state.blocked_disposition = ""
-        state.routine_blocker_count = 0
-        self._save()
 
     @goal_control
     def clear(self) -> None:
@@ -1661,15 +1642,9 @@ class GoalManager(GoalFencingMixin):
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
         self._owned_row()
-        gate_text = f"{reason}\n{last_response}"
-        if _matches_declared_human_gate(gate_text, state.contract):
-            verdict, wait_directive = "blocked", {"disposition": "human_gate"}
-        if verdict == "done" and _partial_delivery(state.goal, state.contract, last_response):
-            verdict, reason, wait_directive = "continue", "partial delivery is not completion", None
         state.last_verdict = verdict
         state.last_reason = reason
         if verdict != "blocked":
-            state.blocked_disposition = ""
             state.routine_blocker_count = 0
         # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
         # doesn't trip the auto-pause meant for bad judge models; transport failures are counted
@@ -1686,26 +1661,24 @@ class GoalManager(GoalFencingMixin):
         # of scope, needs user input). See #100954.
         if verdict == "blocked":
             disposition = (wait_directive or {}).get("disposition", "no_safe_path")
-            if disposition == "human_gate" and not _matches_declared_human_gate(gate_text, state.contract):
+            gate_id = _normalize_gate_id((wait_directive or {}).get("gate_id", ""))
+            if disposition == "human_gate" and not _declares_gate(state.contract, gate_id):
                 disposition = "routine_choice"
-            state.blocked_disposition = disposition
             if disposition == "routine_choice":
                 state.routine_blocker_count += 1
-                if state.routine_blocker_count < 2:
-                    self._save()
-                    return _decision("active", True, _ROUTINE_CHOICE_PROMPT, "continue", reason,
-                                     "↻ Routine choice rejected as a human blocker.", disposition)
-                state.blocked_disposition = "exception_review"
-                return self._pause_decision(
-                    "independent exception review required", "blocked", reason,
-                    "⏸ Goal parked for independent exception review. Use /review, then an admin must run "
-                    "/goal exception-reviewed approve|reject.",
-                ) | {"disposition": "exception_review"}
+                prompt = (_ROUTINE_CHOICE_PROMPT if state.routine_blocker_count < 2
+                          else _EXCEPTION_REVIEW_PROMPT.format(generation=state.generation))
+                self._save()
+                return _decision("active", True, prompt, "continue", reason,
+                                 "↻ Routine choice rejected as a human blocker.", disposition)
             state.routine_blocker_count = 0
-            return self._pause_decision(
+            decision = self._pause_decision(
                 f"judged unachievable ({disposition}): {reason}", "blocked", reason,
                 f"🚫 Goal judged unachievable ({disposition}) — paused: {reason}",
             ) | {"disposition": disposition}
+            if disposition == "human_gate":
+                decision["gate_id"] = gate_id
+            return decision
 
         if verdict == "done":
             state.status = "done"

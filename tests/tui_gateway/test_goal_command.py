@@ -180,6 +180,20 @@ def test_goal_bare_shows_status_when_none_set(server, session):
     assert "No active goal" in r["result"]["output"]
 
 
+def test_goal_contract_show_preserves_pr_only_boundary(server, session):
+    sid, _, _ = session
+    set_result = _call(
+        server, "command.dispatch", name="goal",
+        arg="fix it\noutcome: Open a PR for the fix\nverification: PR URL exists",
+        session_id=sid,
+    )
+    shown = _call(server, "command.dispatch", name="goal", arg="show", session_id=sid)
+
+    assert set_result["result"]["type"] == "send"
+    assert "No merge or deployment workflow scope" in set_result["result"]["notice"]
+    assert "Workflow scope (not tool permission)" in shown["result"]["output"]
+
+
 def _exhaust_budget(session_key: str, goal_text: str = "finish the benchmark"):
     """Set a 1-turn goal and drive it to budget-exhaustion auto-pause."""
     from hermes_cli.goals import GoalManager
