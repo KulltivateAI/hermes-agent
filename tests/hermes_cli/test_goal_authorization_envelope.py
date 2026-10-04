@@ -76,6 +76,12 @@ def test_explicit_stopping_boundary_wins_over_fix_or_deploy_words(outcome, verif
     ("Open a PR for the fix", "", "pr"),
     ("Deploy the fix live", "stop at PR", "pr"),
     ("Deploy the fix live", "do not deploy", "merged"),
+    ("Review and merge the fix", "", "merged"),
+    ("Plan and deploy the release", "", "deployed"),
+    ("Audit then deploy live", "", "deployed"),
+    ("Draft and merge the fix", "", "merged"),
+    ("Review and merge the fix", "review only", "none"),
+    ("Plan and deploy the release", "local only", "none"),
     ("Ship a draft release note", "", "none"),
 ])
 def test_completion_stage_is_derived_from_outcome_and_boundaries(outcome, boundaries, stage):

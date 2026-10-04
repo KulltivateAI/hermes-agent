@@ -359,7 +359,7 @@ def _completion_stage(contract: GoalContract) -> str:
     ).strip()
     words = set(outcome.split())
     first_word = outcome.split()[0] if outcome else ""
-    none_boundary = first_word in {"review", "plan", "audit", "draft"} or any(
+    none_boundary = any(
         phrase in limits for phrase in ("review only", "plan only", "audit only", "draft only", "local only")
     ) or ("draft" in words and not words & {"deploy", "merge", "live"})
     if none_boundary:
