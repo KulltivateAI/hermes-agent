@@ -169,7 +169,9 @@ def _reserve_prompt(mgr):
 def is_goal_control(arg: str) -> bool:
     """Whether this command controls an existing goal rather than replacing it."""
     normalized = arg.strip().lower()
-    return normalized in _EXACT_HANDLERS or normalized.split(None, 1)[0] in {"wait", "gate"}
+    return normalized in _EXACT_HANDLERS or normalized.split(None, 1)[0] in {
+        "wait", "gate", "exception-reviewed",
+    }
 
 
 def dispatch_goal_command(
@@ -196,6 +198,11 @@ def dispatch_goal_command(
         if verb == "gate":
             prefix = "/goal gate"
             return _gate(mgr, rest, authorize_gate)
+        if verb == "exception-reviewed":
+            return GoalCommandResult(
+                "/goal exception-reviewed is disabled: review guidance cannot clear or authorize a goal.",
+                error=True,
+            )
         return _set(mgr, rest if verb == "draft" else arg,
                     drafting=verb == "draft", last_user_message=last_user_message,
                     render=render, progress=progress)

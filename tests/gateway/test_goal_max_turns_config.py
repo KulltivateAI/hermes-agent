@@ -37,9 +37,9 @@ def _make_runner() -> GatewayRunner:
     return runner
 
 
-def _make_goal_event() -> MessageEvent:
+def _make_goal_event(text="/goal ship the benchmark") -> MessageEvent:
     return MessageEvent(
-        text="/goal ship the benchmark",
+        text=text,
         message_type=MessageType.TEXT,
         source=SessionSource(
             platform=Platform.DISCORD,
@@ -77,6 +77,29 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         assert state.max_turns == 7
     finally:
         goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_gateway_contract_show_and_disabled_review_clearance(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    goals._get_session_db()
+    runner = _make_runner()
+
+    await GatewayRunner._handle_goal_command(runner, _make_goal_event(
+        "/goal fix it\noutcome: Open a PR for the fix\nverification: PR URL exists"
+    ))
+    shown = await GatewayRunner._handle_goal_command(runner, _make_goal_event("/goal show"))
+    denied = await GatewayRunner._handle_goal_command(
+        runner, _make_goal_event("/goal exception-reviewed approve")
+    )
+
+    state = goals.GoalManager("sid-gateway-goal-config").state
+    assert state is not None and state.goal == "fix it" and state.status == "active"
+    assert "No merge or deployment workflow scope" in shown
+    assert "is disabled" in denied
 
 
 @pytest.mark.asyncio
