@@ -493,6 +493,18 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 
+def _mandate_part(agent: Any) -> Optional[str]:
+    """Validated mandate from this agent's profile home; invalid state is never projected."""
+    from agent.mandate_manifest import AgentManifestError, load_agent_manifest, render_agent_mandate
+    home = _agent_home(agent) or get_hermes_home()
+    try:
+        manifest = load_agent_manifest(home)
+    except AgentManifestError as exc:
+        logger.warning("Ignoring invalid Agent Mandate Manifest at %s: %s", home, exc)
+        return None
+    return render_agent_mandate(manifest) if manifest is not None else None
+
+
 def _guidance_parts(agent: Any) -> List[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
     parts: List[str] = []
@@ -614,6 +626,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    mandate_part = _mandate_part(agent)
+    if mandate_part:
+        stable_parts.append(mandate_part)
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.

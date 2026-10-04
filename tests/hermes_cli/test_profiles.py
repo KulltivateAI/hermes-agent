@@ -181,6 +181,7 @@ class TestCreateProfile:
         (default_home / "config.yaml").write_text("model: test")
         (default_home / ".env").write_text("KEY=val")
         (default_home / "SOUL.md").write_text("Be helpful.")
+        (default_home / "AGENT_MANIFEST.yaml").write_text("version: 1\n")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
@@ -189,6 +190,7 @@ class TestCreateProfile:
         assert cloned_config["model"] == "test"
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / "AGENT_MANIFEST.yaml").read_text() == "version: 1\n"
 
 
 
@@ -778,6 +780,7 @@ class TestExportImport:
         (default_dir / "config.yaml").write_text("model: test")
         (default_dir / ".env").write_text("KEY=val")
         (default_dir / "SOUL.md").write_text("Be nice.")
+        (default_dir / "AGENT_MANIFEST.yaml").write_text("version: 1\nrole: ops\n")
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
@@ -792,7 +795,20 @@ class TestExportImport:
         assert "default/config.yaml" in names
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
+        assert "default/AGENT_MANIFEST.yaml" in names
         assert "default/memories/MEMORY.md" in names
+
+    def test_manifest_survives_clone_all_and_export_import(self, profile_env, tmp_path):
+        source = create_profile("source", no_alias=True)
+        manifest = "version: 1\nrole: ops\nowns: []\nroutes: {}\nprotected: []\n"
+        (source / "AGENT_MANIFEST.yaml").write_text(manifest)
+
+        clone = create_profile("clone", clone_from="source", clone_all=True, no_alias=True)
+        assert (clone / "AGENT_MANIFEST.yaml").read_text() == manifest
+
+        archive = export_profile("source", str(tmp_path / "source.tar.gz"))
+        imported = import_profile(str(archive), name="imported")
+        assert (imported / "AGENT_MANIFEST.yaml").read_text() == manifest
 
 
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):

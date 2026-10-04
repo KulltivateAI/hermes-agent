@@ -129,6 +129,47 @@ def _prompt_parts(agent):
         return build_system_prompt_parts(agent)
 
 
+def test_agent_mandate_uses_explicit_agent_home_in_cron_context(tmp_path, monkeypatch):
+    own_home = tmp_path / "own"
+    ambient_home = tmp_path / "ambient"
+    own_home.mkdir()
+    ambient_home.mkdir()
+    (own_home / "AGENT_MANIFEST.yaml").write_text(
+        "version: 1\nrole: ops\nowns: [platform]\nroutes:\n  shared_capability: ops\n"
+        "  business_decision: drew\nprotected: [release_approval]\n"
+    )
+    (ambient_home / "AGENT_MANIFEST.yaml").write_text(
+        "version: 1\nrole: wrong_profile\nowns: []\nroutes: {}\nprotected: []\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    agent = _make_agent(
+        skip_context_files=True,
+        load_soul_identity=True,
+        _session_db=SimpleNamespace(db_path=own_home / "state.db"),
+    )
+
+    stable = _prompt_parts(agent)["stable"]
+
+    assert "# Agent Mandate\nRole: ops" in stable
+    assert "shared_capability -> ops" in stable
+    assert "business_decision -> drew" in stable
+    assert "release_approval" in stable
+    assert "wrong_profile" not in stable
+
+
+def test_missing_or_invalid_manifest_does_not_change_prompt_or_project_raw_fields(tmp_path):
+    agent = _make_agent(_session_db=SimpleNamespace(db_path=tmp_path / "state.db"))
+    missing = _prompt_parts(agent)
+    assert _prompt_parts(agent) == missing
+    (tmp_path / "AGENT_MANIFEST.yaml").write_text(
+        "version: 1\nrole: ops\nowns: []\nroutes: {}\nprotected: []\n"
+        "client_secret: never-project-this\n"
+    )
+    invalid = _prompt_parts(agent)
+    assert invalid == missing
+    assert "never-project-this" not in "\n".join(invalid.values())
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
