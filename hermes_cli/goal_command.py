@@ -122,6 +122,16 @@ def _gate(mgr, arg, authorize_gate):
         return GoalCommandResult(f"/goal gate {operation}: {exc}", error=True)
 
 
+def _exception_reviewed(mgr, arg, authorize_gate):
+    if arg not in {"approve", "reject"}:
+        return GoalCommandResult("Usage: /goal exception-reviewed <approve|reject>", error=True)
+    if denial := authorize_gate():
+        return GoalCommandResult(denial, error=True)
+    mgr.resolve_exception_review(arg == "approve")
+    return GoalCommandResult("✓ Exception review approved; /goal resume is now available."
+                             if arg == "approve" else "✓ Exception review rejected; goal cleared.")
+
+
 def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     if drafting:
         if not arg:
@@ -169,7 +179,7 @@ def _reserve_prompt(mgr):
 def is_goal_control(arg: str) -> bool:
     """Whether this command controls an existing goal rather than replacing it."""
     normalized = arg.strip().lower()
-    return normalized in _EXACT_HANDLERS or normalized.split(None, 1)[0] in {"wait", "gate"}
+    return normalized in _EXACT_HANDLERS or normalized.split(None, 1)[0] in {"wait", "gate", "exception-reviewed"}
 
 
 def dispatch_goal_command(
@@ -196,6 +206,9 @@ def dispatch_goal_command(
         if verb == "gate":
             prefix = "/goal gate"
             return _gate(mgr, rest, authorize_gate)
+        if verb == "exception-reviewed":
+            prefix = "/goal exception-reviewed"
+            return _exception_reviewed(mgr, rest.lower(), authorize_gate)
         return _set(mgr, rest if verb == "draft" else arg,
                     drafting=verb == "draft", last_user_message=last_user_message,
                     render=render, progress=progress)

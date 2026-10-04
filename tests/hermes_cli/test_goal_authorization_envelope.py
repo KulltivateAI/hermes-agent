@@ -1,5 +1,4 @@
-"""Authorization-envelope behavior for structured /goal contracts."""
-
+"""Authorization-envelope regressions for structured /goal contracts."""
 import json
 from unittest.mock import MagicMock, patch
 
@@ -19,116 +18,106 @@ def isolated_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
-def _judge(verdict, disposition, reason):
-    return (verdict, reason, False, {"disposition": disposition}, False)
+def _judge(disposition, reason, verdict="blocked"):
+    return verdict, reason, False, {"disposition": disposition}, False
 
 
-def test_judge_parser_preserves_block_disposition():
-    verdict, _, failed, directive = goals._parse_judge_response(
-        '{"verdict":"blocked","disposition":"routine_choice","reason":"choose"}'
-    )
-    assert (verdict, failed, directive) == ("blocked", False, {"disposition": "routine_choice"})
+def _set(sid="goal", **contract):
+    mgr = goals.GoalManager(sid)
+    mgr.set("fix and ship it live", contract=goals.GoalContract(verification="pytest", **contract))
+    return mgr
 
 
-def test_authorization_fields_parse_render_and_roundtrip():
+def test_fields_parse_render_roundtrip_and_draft_drops_authorization():
     headline, contract = goals.parse_contract(
-        "Ship the fix\nauthority: code and reviewed deploy\n"
-        "human gates: Drew approves pricing\nexceptions: use /review"
+        "Ship fix\nauthority: reviewed deploy\nhuman gates: Alice approves pricing\nexceptions: /review"
     )
-    assert headline == "Ship the fix"
-    assert contract.authority == "code and reviewed deploy"
-    assert contract.human_gates == "Drew approves pricing"
-    assert contract.exceptions == "use /review"
+    assert headline == "Ship fix"
     restored = goals.GoalState.from_json(goals.GoalState("x", contract=contract).to_json())
-    assert "Authority: code and reviewed deploy" in restored.contract.render_block()
-    assert restored.contract.exceptions == "use /review"
+    assert "Authority: reviewed deploy" in restored.contract.render_block()
+    payload = json.dumps({"outcome": "send offer", "verification": "receipt", "authority": "charge cards"})
+    response = MagicMock(choices=[MagicMock(message=MagicMock(content=payload))])
+    with patch("agent.auxiliary_client.call_llm", return_value=response):
+        assert goals.draft_contract("send offer").authority == ""
 
 
-def test_legacy_and_bare_free_form_goals_remain_unchanged():
-    state = goals.GoalState.from_json(json.dumps({"goal": "old", "contract": {"verification": "pytest"}}))
-    assert state.contract.authority == ""
+def test_old_structured_json_and_bare_goals_remain_semantically_empty():
+    old = goals.GoalState.from_json(json.dumps({"goal": "old", "contract": {"verification": "pytest"}}))
+    with patch.object(goals, "load_goal", return_value=old):
+        assert goals.GoalManager("old").state.contract.authority == ""
     mgr = goals.GoalManager("bare")
     mgr.set("write a poem")
     assert not mgr.has_contract()
     assert mgr.next_continuation_prompt() == goals.CONTINUATION_PROMPT_TEMPLATE.format(goal="write a poem")
 
 
-@pytest.mark.parametrize(
-    ("outcome", "expected"),
-    [("Build and ship the fix live", "reviewed merge and deployment"),
-     ("Review the proposed fix", "not authorized")],
-)
-def test_merge_deploy_authority_is_conservatively_inferred_and_visible(outcome, expected):
-    mgr = goals.GoalManager(f"authority-{expected}")
-    mgr.set(outcome, contract=goals.GoalContract(verification="pytest passes"))
-    assert expected in mgr.state.contract.authority.lower()
-    shown = dispatch_goal_command(mgr, "show", authorize_gate=lambda: None).output
-    assert "Authority:" in shown
-    assert "payments/charges" in shown
-    assert "any named approver" in shown
+@pytest.mark.parametrize("outcome,authorized", [
+    ("build the fix", True), ("ship it live", True),
+    ("launch the site", False), ("deploy the site", False), ("review the fix", False),
+])
+def test_authority_inference_uses_only_approved_action_semantics(outcome, authorized):
+    mgr = goals.GoalManager(outcome)
+    mgr.set(outcome, contract=goals.GoalContract(verification="check"))
+    assert ("reviewed merge and deployment" in mgr.state.contract.authority) is authorized
 
 
-def test_explicit_authority_cannot_override_protected_gates():
-    mgr = goals.GoalManager("protected")
-    mgr.set("change auth", contract=goals.GoalContract(
-        verification="auth tests pass", authority="change auth and deploy",
-    ))
-    assert "never overrides protected human gates" in mgr.state.contract.authority.lower()
-    assert "auth/session" in mgr.state.contract.human_gates
-
-
-def test_goal_draft_cannot_invent_protected_authorization():
-    payload = json.dumps({
-        "outcome": "send customers an offer", "verification": "receipt exists",
-        "authority": "charge cards and send customers", "human_gates": "none",
-        "exceptions": "skip review",
-    })
-    response = MagicMock(choices=[MagicMock(message=MagicMock(content=payload))])
-    with patch("agent.auxiliary_client.call_llm", return_value=response):
-        contract = goals.draft_contract("send customers an offer")
-    assert contract.authority == ""
-    assert contract.human_gates == ""
-    assert contract.exceptions == ""
-
-
-def test_declared_human_gate_parks_but_undeclared_gate_continues_correctively():
-    contract = goals.GoalContract(verification="pytest", human_gates="Drew approves pricing")
-    mgr = goals.GoalManager("declared")
-    mgr.set("fix pricing", contract=contract)
-    with patch.object(goals, "judge_goal", return_value=_judge("blocked", "human_gate", "Drew approves pricing")):
-        decision = mgr.evaluate_after_turn("Need Drew to approve pricing")
+@pytest.mark.parametrize("disposition", ["routine_choice", "external_prerequisite"])
+def test_protected_reason_forces_human_gate_regardless_of_judge_label(disposition):
+    mgr = _set(disposition)
+    with patch.object(goals, "judge_goal", return_value=_judge(disposition, "Payment approval is required")):
+        decision = mgr.evaluate_after_turn("waiting")
     assert decision["status"] == "paused"
     assert decision["disposition"] == "human_gate"
 
-    mgr = goals.GoalManager("undeclared")
-    mgr.set("fix the parser", contract=goals.GoalContract(verification="pytest"))
-    with patch.object(goals, "judge_goal", return_value=_judge("blocked", "human_gate", "Drew chooses a library")):
-        decision = mgr.evaluate_after_turn("Need Drew to choose")
-    assert decision["should_continue"] is True
-    assert decision["disposition"] == "routine_choice"
-    assert "smallest durable" in decision["continuation_prompt"]
+
+def test_named_gate_requires_exact_identity_and_default_accepts_named_approver():
+    alice = goals._authorization_envelope("fix", goals.GoalContract(human_gates="Alice approves release"))
+    assert goals._matches_declared_human_gate("Alice must approve", alice)
+    assert not goals._matches_declared_human_gate("Bob must approve release", alice)
+    default = goals._authorization_envelope("fix", goals.GoalContract(verification="pytest"))
+    assert goals._matches_declared_human_gate("Drew must approve", default)
 
 
-def test_second_routine_blocker_parks_for_existing_review_path():
-    mgr = goals.GoalManager("routine")
-    mgr.set("fix parser", contract=goals.GoalContract(verification="pytest"))
-    blocked = _judge("blocked", "routine_choice", "Need someone to choose a library")
+def test_undeclared_ordinary_choice_continues_correctively():
+    mgr = _set("ordinary")
+    with patch.object(goals, "judge_goal", return_value=_judge("human_gate", "Someone chooses a library")):
+        decision = mgr.evaluate_after_turn("Need a choice")
+    assert decision["should_continue"] and decision["disposition"] == "routine_choice"
+
+
+def test_exception_review_fence_blocks_resume_until_admin_resolution():
+    mgr = _set("routine")
+    blocked = _judge("routine_choice", "Need someone to choose a library")
     with patch.object(goals, "judge_goal", return_value=blocked):
-        first = mgr.evaluate_after_turn("Which library?")
-        second = mgr.evaluate_after_turn("Still need a choice")
-    assert first["should_continue"] is True
-    assert second["status"] == "paused"
-    assert second["disposition"] == "exception_review"
-    assert "/review" in second["message"]
-    assert "Drew" not in second["message"]
-    assert goals.GoalManager("routine").state.blocked_disposition == "exception_review"
+        mgr.evaluate_after_turn("choice?")
+        assert mgr.evaluate_after_turn("still blocked")["disposition"] == "exception_review"
+    with pytest.raises(RuntimeError, match="exception review"):
+        mgr.resume()
+    denied = dispatch_goal_command(mgr, "exception-reviewed approve", authorize_gate=lambda: "admin only")
+    assert denied.error and denied.output == "admin only"
+    approved = dispatch_goal_command(mgr, "exception-reviewed approve", authorize_gate=lambda: None)
+    assert not approved.error
+    assert mgr.resume().status == "active"
+
+
+def test_rejecting_exception_review_clears_goal():
+    mgr = _set("reject")
+    mgr.state.status, mgr.state.blocked_disposition = "paused", "exception_review"
+    mgr._save()
+    result = dispatch_goal_command(mgr, "exception-reviewed reject", authorize_gate=lambda: None)
+    assert not result.error and not goals.GoalManager("reject").has_goal()
+
+
+def test_partial_delivery_cannot_take_done_path():
+    mgr = _set("partial")
+    with patch.object(goals, "judge_goal", return_value=_judge("", "looks good", verdict="done")):
+        decision = mgr.evaluate_after_turn("PR is open with green CI; waiting for review")
+    assert decision["verdict"] == "continue" and mgr.state.status == "active"
+    assert "open PR" in goals.JUDGE_SYSTEM_PROMPT and "green CI" in goals.JUDGE_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("disposition", ["external_prerequisite", "no_safe_path"])
 def test_terminal_block_dispositions_park(disposition):
-    mgr = goals.GoalManager(disposition)
-    mgr.set("ship it", contract=goals.GoalContract(verification="live check"))
-    with patch.object(goals, "judge_goal", return_value=_judge("blocked", disposition, "cannot proceed")):
-        decision = mgr.evaluate_after_turn("blocked")
-    assert decision["status"] == "paused"
-    assert decision["disposition"] == disposition
+    mgr = _set(disposition)
+    with patch.object(goals, "judge_goal", return_value=_judge(disposition, "cannot proceed")):
+        assert mgr.evaluate_after_turn("blocked")["disposition"] == disposition

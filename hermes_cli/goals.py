@@ -159,6 +159,8 @@ JUDGE_SYSTEM_PROMPT = (
     "finishes.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
+    "For build/fix/ship/live outcomes, partial milestones are never DONE: green CI only, "
+    "an open PR, a created ticket, or waiting for review all require CONTINUE or WAIT.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "blocked", "disposition": "<kind>", "reason": "<one sentence>"}\n'
@@ -335,7 +337,7 @@ def _authorization_envelope(goal: str, contract: GoalContract) -> GoalContract:
     if not contract.authority:
         if re.search(r"\b(plan|review|audit|assess|analy[sz]e)\b", requested):
             contract.authority = "Analysis only; merge and deployment are not authorized."
-        elif re.search(r"\b(build|fix|ship|launch|deploy|live)\b", requested):
+        elif re.search(r"\b(build|fix|ship|live)\b", requested):
             contract.authority = (
                 "Implementation plus ordinary low-risk reviewed merge and deployment are authorized "
                 "when needed for this outcome; protected categories remain human-gated."
@@ -360,9 +362,28 @@ def _matches_declared_human_gate(reason: str, contract: GoalContract) -> bool:
                  "dns", "pricing", "spend", "legal", "product strategy", "destructive data")
     if any(term in reason_lower for term in protected):
         return True
-    declared = contract.human_gates.replace(_PROTECTED_HUMAN_GATES, "").lower()
-    stems = lambda text: {word[:5] for word in re.findall(r"[a-z]+", text) if len(word) >= 4}
-    return len(stems(declared) & stems(reason_lower)) >= 2
+    declared = contract.human_gates.replace(_PROTECTED_HUMAN_GATES, "")
+    excluded = {"Always", "Need", "Waiting", "Payment", "Customer", "Auth", "Pricing", "Legal", "Product"}
+    def names(text):
+        return ({w for w in re.findall(r"\b[A-Z][a-z]+\b", text) if w not in excluded}
+                if re.search(r"\b(approv|sign.?off|permission)", text, re.I) else set())
+    declared_names, reason_names = names(declared), names(reason)
+    if declared_names:
+        return bool(declared_names & reason_names)
+    if reason_names and "any named approver" in contract.human_gates.lower():
+        return True
+    ignored = {"approve", "approves", "approval", "required", "requires", "human", "gate"}
+    terms = {w for w in re.findall(r"[a-z]+", declared.lower()) if len(w) >= 4 and w not in ignored}
+    return bool(terms & set(re.findall(r"[a-z]+", reason_lower)))
+
+
+def _partial_delivery(goal: str, contract: GoalContract, response: str) -> bool:
+    requested = (contract.outcome or goal).lower()
+    if not re.search(r"\b(build|fix|ship|live)\b", requested):
+        return False
+    partial = re.search(r"\b(green ci|ci (?:is )?green|open (?:pr|pull request)|(?:pr|pull request) (?:is )?open|ticket created|(?:waiting|awaiting) (?:for )?review|review (?:is )?pending)\b", response.lower())
+    complete = re.search(r"\b(deployed|shipped|production verified|verified (?:in )?production|is live|live (?:at|in|on)|built artifact)\b", response.lower())
+    return bool(partial and not complete)
 
 
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
@@ -1183,8 +1204,6 @@ class GoalManager(GoalFencingMixin):
         self._evaluation_owner = None
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
-        if self._state is not None and self._state.has_contract():
-            self._state.contract = _authorization_envelope(self._state.goal, self._state.contract)
 
     # --- introspection ------------------------------------------------
 
@@ -1292,6 +1311,8 @@ class GoalManager(GoalFencingMixin):
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
+        if self._state.blocked_disposition == "exception_review":
+            raise RuntimeError("independent exception review must be resolved before resume")
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
@@ -1303,6 +1324,20 @@ class GoalManager(GoalFencingMixin):
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
+
+    @goal_control
+    def resolve_exception_review(self, approve: bool) -> None:
+        state = self._require_goal()
+        if state.blocked_disposition != "exception_review":
+            raise RuntimeError("no exception review is pending")
+        if not approve:
+            state.status = "cleared"
+            self._save()
+            self._state = None
+            return
+        state.blocked_disposition = ""
+        state.routine_blocker_count = 0
+        self._save()
 
     @goal_control
     def clear(self) -> None:
@@ -1626,6 +1661,8 @@ class GoalManager(GoalFencingMixin):
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
         )
         self._owned_row()
+        if verdict == "done" and _partial_delivery(state.goal, state.contract, last_response):
+            verdict, reason, wait_directive = "continue", "partial delivery is not completion", None
         state.last_verdict = verdict
         state.last_reason = reason
         if verdict != "blocked":
@@ -1646,7 +1683,9 @@ class GoalManager(GoalFencingMixin):
         # of scope, needs user input). See #100954.
         if verdict == "blocked":
             disposition = (wait_directive or {}).get("disposition", "no_safe_path")
-            if disposition == "human_gate" and not _matches_declared_human_gate(reason, state.contract):
+            if _matches_declared_human_gate(reason, state.contract):
+                disposition = "human_gate"
+            elif disposition == "human_gate":
                 disposition = "routine_choice"
             state.blocked_disposition = disposition
             if disposition == "routine_choice":
@@ -1658,8 +1697,8 @@ class GoalManager(GoalFencingMixin):
                 state.blocked_disposition = "exception_review"
                 return self._pause_decision(
                     "independent exception review required", "blocked", reason,
-                    "⏸ Goal parked for independent exception review. Use the existing /review path; "
-                    "do not ask a named approver unless review identifies a declared gate.",
+                    "⏸ Goal parked for independent exception review. Use /review, then an admin must run "
+                    "/goal exception-reviewed approve|reject.",
                 ) | {"disposition": "exception_review"}
             state.routine_blocker_count = 0
             return self._pause_decision(
