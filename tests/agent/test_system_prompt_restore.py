@@ -24,7 +24,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
-from agent.mandate_manifest import AgentManifestError, load_agent_manifest, render_agent_mandate, render_manifest_state_frame, resolve_manifest_route, stored_prompt_manifest_stale
+from agent.mandate_manifest import (
+    AgentManifestError,
+    load_agent_manifest,
+    render_agent_mandate,
+    render_manifest_state_frame,
+    stored_prompt_manifest_stale,
+)
 
 _TEST_HOME = Path("/test/hermes-profile")
 
@@ -80,14 +86,6 @@ def test_unsafe_manifest_is_rejected_without_blocking(tmp_path, kind):
     started = time.monotonic()
     with pytest.raises(AgentManifestError): load_agent_manifest(tmp_path)
     assert time.monotonic() - started < 1
-
-
-def test_manifest_routing_preserves_named_approver(tmp_path):
-    _write_manifest(tmp_path)
-    assert resolve_manifest_route(tmp_path, "shared_capability") == "ops"
-    identity = "Drew Smith <drew@example.test>"
-    assert resolve_manifest_route(tmp_path, "x", named_approver=identity) == identity
-    with pytest.raises(AgentManifestError): resolve_manifest_route(tmp_path, "x", named_approver=" ")
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):

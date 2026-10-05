@@ -1,4 +1,8 @@
-"""Strict per-profile Agent Mandate Manifest loading and routing."""
+"""Strict per-profile Agent Mandate Manifest loading and prompt rendering.
+
+Runtime named-approver precedence belongs in the first real routing consumer
+(Solution 5), which must preserve explicit named approvers over manifest routes.
+"""
 
 from __future__ import annotations
 
@@ -138,14 +142,6 @@ def stored_prompt_manifest_stale(prompt: str, profile_home: Path | str) -> bool:
     return prompt.split("\n", 1)[0] != render_manifest_state_frame(manifest, profile_home)
 
 
-def _resolve_manifest_route(manifest: AgentManifest | None, category: str, *, named_approver=None) -> str | None:
-    if named_approver is not None and (not isinstance(named_approver, str) or not named_approver.strip()):
-        raise AgentManifestError("named_approver must be a non-empty string")
-    if named_approver is not None:
-        return named_approver
-    return manifest.routes.get(category) if manifest is not None and isinstance(category, str) else None
-
-
-def resolve_manifest_route(profile_home: Path | str, category: str, *, named_approver=None) -> str | None:
-    manifest = None if named_approver is not None else load_agent_manifest(profile_home)
-    return _resolve_manifest_route(manifest, category, named_approver=named_approver)
+def _resolve_manifest_route(manifest: AgentManifest, category: str) -> str | None:
+    """Resolve one exact route from the immutable manifest snapshot; never fall back."""
+    return manifest.routes.get(category)
