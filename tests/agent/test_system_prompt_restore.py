@@ -16,11 +16,78 @@ instead of rebuilding).  Covers:
 from __future__ import annotations
 
 import logging
+import os
+import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.mandate_manifest import AgentManifestError, load_agent_manifest, render_agent_mandate, render_manifest_state_frame, resolve_manifest_route, stored_prompt_manifest_stale
+
+_TEST_HOME = Path("/test/hermes-profile")
+
+
+def _framed(prompt: str, home: Path = _TEST_HOME) -> str:
+    return render_manifest_state_frame(None, home) + "\n\n" + prompt
+
+
+_MANIFEST = """version: 1
+role: account_manager
+owns: [renewals, client_health]
+routes: {shared_capability: ops, business_decision: drew}
+protected: [release_approval, customer_send]
+"""
+
+
+def _write_manifest(home, content=_MANIFEST):
+    (home / "AGENT_MANIFEST.yaml").write_text(content, encoding="utf-8")
+
+
+def test_manifest_frame_is_profile_bound_and_snapshot_is_immutable(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    none, other = render_manifest_state_frame(None, first), render_manifest_state_frame(None, second)
+    assert ";state=none -->" in none and none != other and str(first) not in none
+    assert not stored_prompt_manifest_stale(none + "\n\nSOUL", first)
+    assert stored_prompt_manifest_stale("forged\n" + none, first)
+    _write_manifest(first); manifest = load_agent_manifest(first)
+    assert manifest is not None
+    _write_manifest(first, _MANIFEST.replace("shared_capability: ops", "shared_capability: drew"))
+    rendered = render_agent_mandate(manifest, first)
+    assert ";state=digest:" in rendered.splitlines()[0] and "shared_capability -> ops" in rendered
+
+
+@pytest.mark.parametrize("content", [
+    "version: 1\nrole: ops\nrole: drew\nowns: []\nroutes: {}\nprotected: []\n",
+    "version: 1\nrole: Ops Team\nowns: []\nroutes: {}\nprotected: []\n",
+    "version: 1\nrole: ops\nowns: [work, work]\nroutes: {}\nprotected: []\n",
+    "version: 2\nrole: ops\nowns: []\nroutes: {}\nprotected: []\n",
+])
+def test_invalid_manifest_fails_closed(tmp_path, content):
+    _write_manifest(tmp_path, content)
+    with pytest.raises(AgentManifestError): load_agent_manifest(tmp_path)
+
+
+@pytest.mark.parametrize("kind", ["oversize", "symlink", "fifo"])
+def test_unsafe_manifest_is_rejected_without_blocking(tmp_path, kind):
+    path = tmp_path / "AGENT_MANIFEST.yaml"
+    if kind == "oversize": path.write_bytes(_MANIFEST.encode() + b"#" * (16 * 1024))
+    elif kind == "symlink":
+        outside = tmp_path.parent / "outside-manifest.yaml"; outside.write_text(_MANIFEST); path.symlink_to(outside)
+    else: os.mkfifo(path)
+    started = time.monotonic()
+    with pytest.raises(AgentManifestError): load_agent_manifest(tmp_path)
+    assert time.monotonic() - started < 1
+
+
+def test_manifest_routing_preserves_named_approver(tmp_path):
+    _write_manifest(tmp_path)
+    assert resolve_manifest_route(tmp_path, "shared_capability") == "ops"
+    identity = "Drew Smith <drew@example.test>"
+    assert resolve_manifest_route(tmp_path, "x", named_approver=identity) == identity
+    with pytest.raises(AgentManifestError): resolve_manifest_route(tmp_path, "x", named_approver=" ")
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -32,6 +99,8 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.provider = "openrouter"
     agent.platform = "cli"
     agent._session_db = session_db
+    if isinstance(session_db, MagicMock):
+        session_db.db_path = _TEST_HOME / "state.db"
     # MagicMock attributes are truthy by default; the static-prefix
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
@@ -48,7 +117,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 class TestStoredPromptReuse:
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
-        stored = "Stored prompt from turn 1 — byte-identical reuse"
+        stored = _framed("Stored prompt from turn 1 — byte-identical reuse")
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -64,7 +133,7 @@ class TestStoredPromptReuse:
 
     def test_present_row_with_unicode_preserved(self):
         """Non-ASCII bytes in the stored prompt are not mangled."""
-        stored = "Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊"
+        stored = _framed("Stored prompt with unicode: ☤ ⚗ ◆ — and emoji 🦊")
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -203,7 +272,7 @@ class TestPromptStabilityInvariant:
         This is the core invariant: any byte-level change at this point
         invalidates KV cache on every prefix-cache backend.
         """
-        stored = (
+        stored = _framed(
             "You are Hermes Agent.\n"
             "\n"
             "Conversation started: Sunday, May 17, 2026\n"
@@ -238,7 +307,7 @@ class TestStaticPrefixReconstructionOnRestore:
     """
 
     def test_restore_reconstructs_static_prefix_when_it_matches(self):
-        stable = "STATIC IDENTITY AND GUIDANCE"
+        stable = _framed("STATIC IDENTITY AND GUIDANCE")
         stored = stable + "\n\nper-session context\n\nvolatile tail"
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
@@ -263,7 +332,7 @@ class TestStaticPrefixReconstructionOnRestore:
     def test_restore_leaves_static_unset_on_prefix_mismatch(self):
         """Stable-tier drift (skills edited since persist) → no static prefix,
         legacy layout, restored bytes still authoritative."""
-        stored = "OLD STATIC HEAD\n\nper-session context"
+        stored = _framed("OLD STATIC HEAD\n\nper-session context")
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -274,7 +343,7 @@ class TestStaticPrefixReconstructionOnRestore:
 
         with _patch(
             "agent.system_prompt.build_system_prompt_parts",
-            return_value={"stable": "NEW STATIC HEAD", "context": "", "volatile": ""},
+            return_value={"stable": _framed("NEW STATIC HEAD"), "context": "", "volatile": ""},
         ):
             _restore_or_build_system_prompt(
                 agent, None, [{"role": "user", "content": "hi"}]
@@ -286,7 +355,7 @@ class TestStaticPrefixReconstructionOnRestore:
     def test_restore_survives_parts_builder_exception(self):
         """Prefix reconstruction is fail-open: a parts-builder crash must not
         break the byte-identical restore."""
-        stored = "Stored prompt — must survive"
+        stored = _framed("Stored prompt — must survive")
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
@@ -394,7 +463,7 @@ class TestPerResponseSessionWritePath:
     """
 
     def _agent(self, db, session_id):
-        agent = _make_agent(session_db=db, prebuilt_prompt="GROUP_PROMPT")
+        agent = _make_agent(session_db=db, prebuilt_prompt=_framed("GROUP_PROMPT", Path(db.db_path).parent))
         agent.session_id = session_id
         return agent
 
@@ -413,7 +482,9 @@ class TestPerResponseSessionWritePath:
                 [{"role": "user", "content": "hi"}],
             )
 
-            assert db.get_session(session_id)["system_prompt"] == "GROUP_PROMPT"
+            row = db.get_session(session_id)
+            assert row is not None
+            assert row["system_prompt"].endswith("\n\nGROUP_PROMPT")
 
     def test_warning_is_a_first_turn_artifact_not_a_lost_write(
         self, tmp_path, caplog
@@ -442,7 +513,7 @@ class TestPerResponseSessionWritePath:
             ):
                 _restore_or_build_system_prompt(second, None, history)
 
-            assert second._cached_system_prompt == "GROUP_PROMPT"
+            assert second._cached_system_prompt.endswith("\n\nGROUP_PROMPT")
             second._build_system_prompt.assert_not_called()
             assert "is null" not in caplog.text
 

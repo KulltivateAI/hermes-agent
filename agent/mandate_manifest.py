@@ -18,7 +18,8 @@ from yaml.constructor import ConstructorError
 
 MANIFEST_FILENAME, _MAX_BYTES = "AGENT_MANIFEST.yaml", 16 * 1024
 _SLUG_RE, _GATE_ID_RE = (re.compile(p) for p in (r"^[a-z0-9][a-z0-9_-]{0,63}$", r"^[a-z0-9]+(?:_[a-z0-9]+)*$"))
-_FIELDS, _DIGEST_PREFIX = frozenset({"version", "role", "owns", "routes", "protected"}), "<!-- agent-manifest-sha256:"
+_FIELDS = frozenset({"version", "role", "owns", "routes", "protected"})
+_FRAME_PREFIX = "<!-- agent-manifest-state:v1;"
 
 
 class AgentManifestError(ValueError): """The opted-in manifest is invalid, unreadable, or unsafe."""
@@ -107,16 +108,23 @@ def load_agent_manifest(profile_home: Path | str) -> AgentManifest | None:
                          MappingProxyType(routes), _unique_list(data["protected"], "protected", _gate_id))
 
 
-def manifest_digest(manifest: AgentManifest, profile_home: Path | str) -> str:
-    projected = [str(Path(profile_home).expanduser().resolve()), manifest.version, manifest.role,
-                 sorted(manifest.owns), sorted(manifest.routes.items()), sorted(manifest.protected)]
+def manifest_digest(manifest: AgentManifest) -> str:
+    projected = [manifest.version, manifest.role, sorted(manifest.owns),
+                 sorted(manifest.routes.items()), sorted(manifest.protected)]
     return hashlib.sha256(json.dumps(projected, separators=(",", ":")).encode()).hexdigest()
+
+
+def render_manifest_state_frame(manifest: AgentManifest | None, profile_home: Path | str) -> str:
+    """Renderer-owned first line; profile identity is bound but never disclosed."""
+    identity = hashlib.sha256(str(Path(profile_home).expanduser().resolve()).encode()).hexdigest()
+    state = f"digest:{manifest_digest(manifest)}" if manifest is not None else "none"
+    return f"{_FRAME_PREFIX}profile-sha256={identity};state={state} -->"
 
 
 def render_agent_mandate(manifest: AgentManifest, profile_home: Path | str) -> str:
     routes = [f"- {category} -> {_resolve_manifest_route(manifest, category)}" for category in sorted(manifest.routes)]
     return "\n".join([
-        f"{_DIGEST_PREFIX}{manifest_digest(manifest, profile_home)} -->", "# Agent Mandate",
+        render_manifest_state_frame(manifest, profile_home), "# Agent Mandate",
         f"Role: {manifest.role}", f"Owns: {', '.join(sorted(manifest.owns)) or '(none)'}", "Routes:",
         *(routes or ["- (none)"]),
         f"Protected goal gates (mandatory human gates; never permission): {', '.join(sorted(manifest.protected)) or '(none)'}",
@@ -125,10 +133,9 @@ def render_agent_mandate(manifest: AgentManifest, profile_home: Path | str) -> s
 
 
 def stored_prompt_manifest_stale(prompt: str, profile_home: Path | str) -> bool:
-    manifest = load_agent_manifest(profile_home); first_line = prompt.split("\n", 1)[0]
-    marker = f"{_DIGEST_PREFIX}{manifest_digest(manifest, profile_home)} -->" if manifest else None
-    if marker: return first_line != marker
-    return first_line.startswith(_DIGEST_PREFIX) and prompt.startswith(first_line + "\n# Agent Mandate\n")
+    """Compare only the canonical renderer-owned first line."""
+    manifest = load_agent_manifest(profile_home)
+    return prompt.split("\n", 1)[0] != render_manifest_state_frame(manifest, profile_home)
 
 
 def _resolve_manifest_route(manifest: AgentManifest | None, category: str, *, named_approver=None) -> str | None:
