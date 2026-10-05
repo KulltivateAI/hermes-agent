@@ -664,6 +664,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+        from agent.mandate_manifest import stored_prompt_manifest_stale
+        from agent.system_prompt import _agent_home
+        from hermes_constants import get_hermes_home
+        if stored_prompt_manifest_stale(stored_prompt, _agent_home(agent) or get_hermes_home()):
+            logger.info("Agent Mandate Manifest changed for session %s; rebuilding prompt once.", agent.session_id)
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            _persist_system_prompt(agent, "System prompt persistence failed after manifest refresh (%s): %s.")
+            return
         if _bot_chat_prompt_stale(agent, stored_prompt):
             logger.info(
                 "Bot Chat capability epoch changed for session %s; rebuilding system prompt to "
