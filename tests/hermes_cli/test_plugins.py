@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import asyncio
 import logging
 import json
 import sys
@@ -1125,6 +1126,41 @@ class TestForceReloadSymmetry:
         mgr.invoke_hook("pre_gateway_dispatch", event=object())
 
         assert seen["thread"] is not threading.current_thread()
+
+    def test_gateway_dispatch_hands_worker_host_owner_without_serializing(self, monkeypatch):
+        from dataclasses import asdict
+        from gateway.config import Platform
+        from gateway.platforms.event import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0)
+        seen = {}
+        event = MessageEvent("hi", source=SessionSource(
+            platform=Platform.DISCORD, chat_id="c", user_id="u"))
+        mgr = PluginManager()
+
+        def capture(event, **_kwargs):
+            seen.update(task=event._hermes_dispatch_task, loop=event._hermes_dispatch_loop,
+                        worker=threading.current_thread())
+
+        mgr._hooks["pre_gateway_dispatch"] = [capture]
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        runner = object.__new__(GatewayRunner)
+
+        async def dispatch():
+            caller = asyncio.current_task()
+            loop = asyncio.get_running_loop()
+            assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is event
+            assert (seen["task"], seen["loop"]) == (caller, loop)
+
+        asyncio.run(dispatch())
+        assert seen["worker"] is not threading.current_thread()
+        assert "_hermes_dispatch_task" not in event.__dict__
+        assert "_hermes_dispatch_loop" not in event.__dict__
+        assert "hermes_dispatch" not in repr(event)
+        assert not any("hermes_dispatch" in key for key in asdict(event))
 
     def test_hook_exception_still_isolated_under_timeout_path(self, monkeypatch):
         monkeypatch.setattr(
