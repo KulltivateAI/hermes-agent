@@ -49,7 +49,12 @@ class GatewayInboundMixin:
         event._plugin_hook_ran = True
         event._plugin_authorized = False
         _plugin_authorized = False
+        # Policy callbacks run in a copied Context on a timeout worker. Hand them the real
+        # gateway owner as host-only, process-local references; these attributes are not
+        # dataclass fields and are removed as soon as dispatch returns.
         try:
+            setattr(event, "_hermes_dispatch_task", asyncio.current_task())
+            setattr(event, "_hermes_dispatch_loop", asyncio.get_running_loop())
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _hook_results = _invoke_hook(
                 "pre_gateway_dispatch", event=event, gateway=self,
@@ -59,6 +64,9 @@ class GatewayInboundMixin:
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             return None
+        finally:
+            event.__dict__.pop("_hermes_dispatch_task", None)
+            event.__dict__.pop("_hermes_dispatch_loop", None)
 
         # A fail-closed denial from any callback must dominate authorization regardless of callback
         # order (for example, when a later callback times out after an earlier one authorizes).
