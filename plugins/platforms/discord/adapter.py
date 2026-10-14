@@ -1544,6 +1544,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
+        if not await self._ensure_required_thread_members(thread_channel):
+            return SendResult(success=False, error="Required thread membership failed; thread deleted.")
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
 
@@ -1621,6 +1623,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
+        if not await self._ensure_required_thread_members(thread_channel):
+            return SendResult(success=False, error="Required thread membership failed; thread deleted.")
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
 
@@ -3908,6 +3912,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=auto_archive_duration,
                 reason=reason,
             )
+            if not await self._ensure_required_thread_members(thread):
+                return {"error": "Required thread membership failed; thread deleted."}
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -3924,6 +3930,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=auto_archive_duration,
                     reason=reason,
                 )
+                if not await self._ensure_required_thread_members(thread):
+                    return {"error": "Required thread membership failed; thread deleted."}
                 return {
                     "success": True,
                     "thread_id": str(thread.id),
@@ -3940,6 +3948,29 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Auto-thread helpers
     # ------------------------------------------------------------------
+
+    async def _ensure_required_thread_members(self, thread: Any) -> bool:
+        """Enroll configured principals or delete the newly created thread."""
+        try:
+            for user_id in _required_thread_member_ids():
+                if discord is None:
+                    raise RuntimeError("discord.py is unavailable")
+                await thread.add_user(discord.Object(id=int(user_id)))
+                member = await thread.fetch_member(int(user_id))
+                if str(getattr(member, "id", "")) != user_id:
+                    raise RuntimeError(f"Discord membership verification failed for user_id {user_id}")
+            return True
+        except Exception as exc:
+            try:
+                await thread.delete(reason="Required Discord thread membership failed")
+            except Exception as cleanup_error:
+                logger.error(
+                    "[%s] Required thread membership failed and cleanup failed: %s; cleanup=%s",
+                    self.name, exc, cleanup_error,
+                )
+            else:
+                logger.error("[%s] Required thread membership failed; thread deleted: %s", self.name, exc)
+            return False
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
@@ -3961,6 +3992,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+            if not await self._ensure_required_thread_members(thread):
+                return None
             return thread
         except Exception as direct_error:
             display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
@@ -3972,6 +4005,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=1440,
                     reason=reason,
                 )
+                if not await self._ensure_required_thread_members(thread):
+                    return None
                 return thread
             except Exception as fallback_error:
                 logger.warning(
@@ -4034,6 +4069,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=1440,
                     reason=reason,
                 )
+                if not await self._ensure_required_thread_members(thread):
+                    return None
                 return str(thread.id)
         except Exception as direct_error:
             logger.debug(
@@ -4052,6 +4089,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason=reason,
             )
+            if not await self._ensure_required_thread_members(thread):
+                return None
             return str(thread.id)
         except Exception as fallback_error:
             logger.warning(
@@ -5794,6 +5833,14 @@ def _standalone_sanitize_error(text) -> str:
     )
 
 
+def _required_thread_member_ids() -> tuple[str, ...]:
+    raw = os.getenv("DISCORD_THREAD_REQUIRED_MEMBER_IDS", "")
+    values = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    if any(not re.fullmatch(r"[0-9]{17,20}", value) for value in values):
+        raise ValueError("DISCORD_THREAD_REQUIRED_MEMBER_IDS contains an invalid snowflake")
+    return values
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -5878,6 +5925,10 @@ async def _standalone_send(
             if is_forum:
                 thread_name = _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
+                try:
+                    required_members = _required_thread_member_ids()
+                except ValueError as exc:
+                    return {"error": str(exc)}
 
                 # Filter to readable media files up front so we can pick the
                 # right code path (JSON vs multipart) before opening a session.
@@ -5938,6 +5989,26 @@ async def _standalone_send(
                             data = await resp.json()
 
                 thread_id_created = data.get("id")
+                try:
+                    for user_id in required_members:
+                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as member_session:
+                            member_url = f"https://discord.com/api/v10/channels/{thread_id_created}/thread-members/{user_id}"
+                            async with member_session.put(member_url, headers=auth_headers, **_req_kw) as member_resp:
+                                if member_resp.status not in {200, 204}:
+                                    raise RuntimeError(f"member add returned {member_resp.status}")
+                            async with member_session.get(member_url, headers=auth_headers, **_req_kw) as member_resp:
+                                member = await member_resp.json() if member_resp.status == 200 else {}
+                                if str(member.get("user_id", "")) != user_id:
+                                    raise RuntimeError(f"membership verification failed for user_id {user_id}")
+                except Exception as exc:
+                    delete_url = f"https://discord.com/api/v10/channels/{thread_id_created}"
+                    try:
+                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as cleanup_session:
+                            async with cleanup_session.delete(delete_url, headers=auth_headers, **_req_kw):
+                                pass
+                    except Exception:
+                        logger.error("Standalone forum thread membership cleanup failed", exc_info=True)
+                    return {"error": _standalone_sanitize_error(f"Required thread membership failed: {exc}")}
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
                 result = {
                     "success": True,

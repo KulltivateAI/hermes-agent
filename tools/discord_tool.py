@@ -432,6 +432,7 @@ def _create_thread(
     **_kwargs: Any,
 ) -> str:
     """Create a thread in a channel."""
+    required_members = _required_thread_member_ids()
     if message_id:
         # Create thread from an existing message
         path = f"/channels/{channel_id}/messages/{message_id}/threads"
@@ -448,19 +449,58 @@ def _create_thread(
             "type": 11,  # PUBLIC_THREAD
         }
     thread = _discord_request("POST", path, token, body=body)
-    return json.dumps({
+    thread_id = str(thread["id"])
+    receipts = _enroll_thread_members(token, thread_id, required_members)
+    result = {
         "success": True,
-        "thread_id": thread["id"],
+        "thread_id": thread_id,
         "name": thread.get("name"),
-    })
+    }
+    if receipts:
+        result["members"] = receipts
+    return json.dumps(result)
 
 
 _SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 
 
-def _require_snowflake(field: str, value: Any) -> None:
+def _require_snowflake(field: str, value: Any) -> str:
     if not isinstance(value, str) or not _SNOWFLAKE_RE.fullmatch(value):
         raise ValueError(f"{field} must be a 17-20 digit Discord snowflake")
+    return value
+
+
+def _required_thread_member_ids() -> Tuple[str, ...]:
+    """Read profile-owned required members before creating a thread."""
+    raw = os.getenv("DISCORD_THREAD_REQUIRED_MEMBER_IDS", "")
+    values = tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
+    for user_id in values:
+        _require_snowflake("DISCORD_THREAD_REQUIRED_MEMBER_IDS", user_id)
+    return values
+
+
+def _enroll_thread_members(
+    token: str, thread_id: str, user_ids: Tuple[str, ...], label: str = "Thread"
+) -> List[Dict[str, Any]]:
+    receipts: List[Dict[str, Any]] = []
+    try:
+        for user_id in user_ids:
+            member_path = f"/channels/{thread_id}/thread-members/{user_id}"
+            _discord_request("PUT", member_path, token)
+            member = _discord_request("GET", member_path, token)
+            if not isinstance(member, dict) or member.get("user_id") != user_id:
+                raise RuntimeError(f"Discord membership verification failed for user_id {user_id}")
+            receipts.append({"user_id": user_id, "verified": True})
+    except Exception as error:
+        cleanup = "deleted"
+        try:
+            _discord_request("DELETE", f"/channels/{thread_id}", token)
+        except Exception:
+            cleanup = "failed"
+        raise RuntimeError(
+            f"{label} {thread_id} membership setup failed; cleanup={cleanup}: {error}"
+        ) from error
+    return receipts
 
 
 def _create_handoff_thread(
@@ -481,6 +521,7 @@ def _create_handoff_thread(
         ("owner_user_id", owner_user_id),
     ):
         _require_snowflake(field, value)
+    required_members = _required_thread_member_ids()
 
     thread = _discord_request(
         "POST",
@@ -488,29 +529,12 @@ def _create_handoff_thread(
         token,
         body={"name": name, "auto_archive_duration": auto_archive_duration},
     )
-    thread_id = thread.get("id") if isinstance(thread, dict) else None
-    _require_snowflake("thread_id", thread_id)
+    thread_id = _require_snowflake(
+        "thread_id", thread.get("id") if isinstance(thread, dict) else None
+    )
 
-    receipts = []
-    try:
-        for user_id in dict.fromkeys((target_user_id, owner_user_id)):
-            member_path = f"/channels/{thread_id}/thread-members/{user_id}"
-            _discord_request("PUT", member_path, token)
-            member = _discord_request("GET", member_path, token)
-            if not isinstance(member, dict) or member.get("user_id") != user_id:
-                raise RuntimeError(
-                    f"Discord membership verification failed for user_id {user_id}"
-                )
-            receipts.append({"user_id": user_id, "verified": True})
-    except Exception as error:
-        cleanup = "deleted"
-        try:
-            _discord_request("DELETE", f"/channels/{thread_id}", token)
-        except Exception:
-            cleanup = "failed"
-        raise RuntimeError(
-            f"Handoff thread {thread_id} membership setup failed; cleanup={cleanup}: {error}"
-        ) from error
+    members = tuple(dict.fromkeys((target_user_id, owner_user_id, *required_members)))
+    receipts = _enroll_thread_members(token, thread_id, members, "Handoff thread")
 
     return json.dumps({
         "success": True,
