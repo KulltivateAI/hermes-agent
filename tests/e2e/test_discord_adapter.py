@@ -5,6 +5,7 @@ Covers the fix for slash commands not being recognized when sent via
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -104,3 +105,30 @@ class TestAutoThreadingPreservesCommand:
         response = get_response_text(discord_adapter)
         assert response is not None
         assert "/new" in response
+
+
+class TestRequiredThreadMembers:
+    async def test_enrolls_and_verifies_every_configured_member(self, discord_adapter, monkeypatch):
+        owner = "834794937081659412"
+        thread = make_fake_thread(thread_id=90002, name="visible")
+        thread.add_user = AsyncMock()
+        thread.fetch_member = AsyncMock(return_value=SimpleNamespace(id=int(owner)))
+        thread.delete = AsyncMock()
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRED_MEMBER_IDS", f"{owner},{owner}")
+
+        assert await discord_adapter._ensure_required_thread_members(thread) is True
+        assert thread.add_user.await_count == 1
+        assert thread.add_user.await_args.args[0].id == int(owner)
+        thread.fetch_member.assert_awaited_once_with(int(owner))
+        thread.delete.assert_not_awaited()
+
+    async def test_deletes_thread_when_membership_cannot_be_verified(self, discord_adapter, monkeypatch):
+        owner = "834794937081659412"
+        thread = make_fake_thread(thread_id=90003, name="hidden")
+        thread.add_user = AsyncMock()
+        thread.fetch_member = AsyncMock(return_value=SimpleNamespace(id=123))
+        thread.delete = AsyncMock()
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRED_MEMBER_IDS", owner)
+
+        assert await discord_adapter._ensure_required_thread_members(thread) is False
+        thread.delete.assert_awaited_once_with(reason="Required Discord thread membership failed")

@@ -453,6 +453,7 @@ class TestCreateThread:
         result = json.loads(discord_core(action="create_thread", channel_id="11", name="New Thread"))
         assert result["success"] is True
         assert result["thread_id"] == "800"
+        assert "members" not in result
         # Verify the API call
         mock_req.assert_called_once_with(
             "POST", "/channels/11/threads", "test-token",
@@ -472,6 +473,21 @@ class TestCreateThread:
             body={"name": "Discussion", "auto_archive_duration": 1440},
         )
 
+    @patch("tools.discord_tool._discord_request")
+    def test_enrolls_and_verifies_configured_required_members(self, mock_req, monkeypatch):
+        owner = "423456789012345678"
+        thread = "523456789012345678"
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setenv("DISCORD_THREAD_REQUIRED_MEMBER_IDS", f" {owner},{owner} ")
+        mock_req.side_effect = [{"id": thread, "name": "Visible"}, None, {"user_id": owner}]
+
+        result = json.loads(discord_core(action="create_thread", channel_id="11", name="Visible"))
+
+        assert result["members"] == [{"user_id": owner, "verified": True}]
+        assert mock_req.call_args_list[-2:] == [
+            call("PUT", f"/channels/{thread}/thread-members/{owner}", "test-token"),
+            call("GET", f"/channels/{thread}/thread-members/{owner}", "test-token"),
+        ]
 
 class TestCreateHandoffThread:
     CHANNEL_ID = "123456789012345678"
@@ -542,6 +558,7 @@ class TestCreateHandoffThread:
 
         assert result["members"] == [{"user_id": self.TARGET_ID, "verified": True}]
         assert mock_req.call_count == 3
+
 
     @patch("tools.discord_tool._discord_request")
     def test_membership_verification_failure_returns_error(self, mock_req, monkeypatch):
